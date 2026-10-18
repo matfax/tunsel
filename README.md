@@ -68,16 +68,3 @@ sudo make integration                # all tests incl. network-namespace end-to-
 make image                           # local image for the build host's platform
 ```
 
-CI (`.github/workflows/ci.yml`) runs everything and builds `linux/amd64`,
-`linux/arm64` and `linux/arm/v7` images, pushing on `v*` tags to
-`ghcr.io/<repository>` unless the `IMAGE`/`REGISTRY` repository variables say
-otherwise. Go and Docker layer caches persist between runs.
-
-Dependencies are kept current by Renovate (`renovate.json`). Actions and base
-images are pinned to commit SHAs / digests. Minor, patch and digest updates
-merge automatically once CI passes; major updates wait for review. This needs,
-on GitHub:
-
-- the [Renovate app](https://github.com/apps/renovate) installed on the repository,
-- "Allow auto-merge" enabled in the repository settings,
-- branch protection on `main` requiring the `test` and `image` checks.
