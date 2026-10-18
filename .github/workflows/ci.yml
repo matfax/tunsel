@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash   # -eo pipefail
+
 # Actions are pinned to commit SHAs; Renovate keeps them current.
 jobs:
   test:
@@ -20,13 +24,24 @@ jobs:
           go-version-file: go.mod   # caches modules and build cache, keyed on go.sum
       - run: go vet ./... && go vet -tags integration ./...
       - name: unit tests
-        run: go test -race ./...
+        run: go test -race ./... 2>&1 | tee unit.log
       - name: integration tests (root, network namespaces)
         run: |
           sudo apt-get update -q && sudo apt-get install -yq nftables conntrack iputils-ping
           # Root reuses the runner's caches instead of starting empty.
           sudo env "PATH=$PATH" GOCACHE="$(go env GOCACHE)" GOMODCACHE="$(go env GOMODCACHE)" \
-            go test -count=1 -tags integration ./...
+            go test -count=1 -tags integration ./... 2>&1 | tee integration.log
+      - name: annotate test failures
+        if: failure()
+        run: |
+          # One annotation per failed step with the failing tests' output, so
+          # the cause shows on the run page without opening the log.
+          for log in unit.log integration.log; do
+            [ -f "$log" ] && grep -q -E '^(--- FAIL|FAIL|panic:)' "$log" || continue
+            msg=$(grep -E -B2 -A25 '^\s*(--- FAIL|panic:)|_test\.go:[0-9]+:' "$log" | head -200 |
+              sed -e 's/%/%25/g' -e 's/\r/%0D/g' | sed ':a;N;$!ba;s/\n/%0A/g')
+            echo "::error title=go test failed ($log)::$msg"
+          done
 
   image:
     needs: test

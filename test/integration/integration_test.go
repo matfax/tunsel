@@ -97,8 +97,10 @@ func topology(t *testing.T) {
 		ip addr add fd99::1/64 dev lan0 nodad
 		ip addr add fd98:1::1/64 dev wg-a nodad
 		ip addr add fd98:2::1/64 dev wg-b nodad
+		ip addr add fd98:3::1/64 dev wan0 nodad
 		for i in lan0 wg-a wg-b wan0; do ip link set $i up; sysctl -qw net.ipv4.conf.$i.rp_filter=0; done
 		ip route add default via 10.98.3.2 dev wan0
+		ip -6 route add default via fd98:3::2 dev wan0
 		ip route add default via 10.98.1.2 dev wg-a table 101
 		ip -6 route add default via fd98:1::2 dev wg-a table 101
 		ip route add default via 10.98.2.2 dev wg-b table 102
@@ -113,7 +115,7 @@ func topology(t *testing.T) {
 		nft add rule ip nat post oifname '{ "wg-a", "wg-b", "wan0" }' masquerade
 		nft add table ip6 nat
 		nft add chain ip6 nat post '{ type nat hook postrouting priority srcnat; }'
-		nft add rule ip6 nat post oifname '{ "wg-a", "wg-b" }' masquerade
+		nft add rule ip6 nat post oifname '{ "wg-a", "wg-b", "wan0" }' masquerade
 	`))
 	sh(t, nsLAN, v6(`
 		ip addr add 10.99.0.2/24 dev eth0; ip link set eth0 up
