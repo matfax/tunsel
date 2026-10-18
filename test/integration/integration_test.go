@@ -350,7 +350,9 @@ func TestEndToEnd(t *testing.T) {
 		if r := d.report(t); !strings.Contains(strings.Join(r.Tunnels[0].Errors, " "), "leaves via wan0") {
 			t.Errorf("route check error not reported: %v", r.Tunnels[0].Errors)
 		}
-		sh(t, nsRtr, v6("ip route add default via 10.98.1.2 dev wg-a table 101\nip -6 route add default via fd98:1::2 dev wg-a table 101"))
+		// Restore what the interface manager would: the routes and, since
+		// they are dropped on link down too, the IPv6 addresses.
+		sh(t, nsRtr, v6("ip route add default via 10.98.1.2 dev wg-a table 101\nip -6 addr replace fd98:1::1/64 dev wg-a nodad\nip -6 route add default via fd98:1::2 dev wg-a table 101"))
 		eventually(t, "wg-a recovered", func() bool { return d.state("wg-a") == "healthy" })
 		if got := via(t, nsLAN, ping(dstStatic)); got != "wg-a" {
 			t.Errorf("static destination via %s after recovery, want wg-a", got)
