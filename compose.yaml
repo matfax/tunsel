@@ -1,0 +1,17 @@
+# Runtime contract: DESIGN.md §9.1.
+services:
+  tunsel:
+    image: ${TUNSEL_IMAGE:-tunsel}:${TUNSEL_TAG:-latest}
+    build: .
+    container_name: tunsel
+    network_mode: host
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN, NET_RAW]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    volumes:
+      - ${TUNSEL_CONFIG:-./config.yaml}:/etc/tunsel/config.yaml:ro
+      - ${TUNSEL_RUN_DIR:-/run/tunsel}:/run/tunsel
+    restart: unless-stopped
+    stop_signal: SIGTERM
+    stop_grace_period: 10s

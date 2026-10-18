@@ -1,0 +1,86 @@
+# tunsel example configuration
+# All values are placeholders (documentation address ranges, generic names).
+# The host must provide, per tunnel: a routing table with a default route via
+# the tunnel, and a rule "fwmark <mark>/<mark_mask> lookup <table>".
+
+nft:
+  table: tunsel            # tool-owned nftables table (family inet)
+  mark_mask: 0xf           # only these mark bits are read/written
+  cleanup_on_exit: false   # remove the table on clean shutdown
+
+tunnels:
+  - name: wg-a             # interface name
+    mark: 0x1
+    families: [ipv4, ipv6] # families the tunnel carries (default: both)
+    health:
+      targets: [192.0.2.1, 198.51.100.1]
+      probe: icmp          # icmp | tcp:<port>
+      interval: 10s
+      timeout: 2s
+      min_ok: 1            # targets that must answer for a round to pass
+      fail_after: 3        # consecutive failed rounds → unhealthy
+      recover_after: 3     # consecutive passed rounds → healthy
+
+  - name: wg-b
+    mark: 0x2
+    health:
+      targets: [203.0.113.1, 198.51.100.2]
+      probe: icmp
+      interval: 10s
+      timeout: 2s
+      min_ok: 1
+      fail_after: 3
+      recover_after: 3
+
+# First healthy tunnel wins for traffic without a learned/static match.
+default_order: [wg-b, wg-a]
+
+ingress:
+  interfaces: [lan0]           # only traffic entering here is steered
+  include_local_output: false  # also steer the host's own traffic
+
+# Never marked (e.g. tunnel endpoints, local/private ranges).
+exclude:
+  - 192.0.2.10/32
+  - 198.51.100.20/32
+  - 10.0.0.0/8
+  - 172.16.0.0/12
+  - 192.168.0.0/16
+  - fc00::/7
+  - fe80::/10
+
+# Fixed preferences, applied only while the tunnel is healthy.
+static_pref:
+  - { prefix: 203.0.113.0/24, tunnel: wg-a }
+  - { prefix: 2001:db8:100::/48, tunnel: wg-a }
+
+conntrack:
+  flush_on_unhealthy: true # delete a failed tunnel's flows so they are re-decided
+
+# Phase 2 (not implemented yet; must stay disabled)
+learning:
+  enabled: false
+  candidates:
+    source: conntrack
+    top_n: 100
+    refresh: 5m
+  probe:
+    port: 443
+    samples: 3
+    timeout: 2s
+  min_gain:
+    abs: 5ms
+    rel: 15%
+  ttl: 1h
+  flap_damping:
+    window: 30m
+    max_switches: 2
+
+log:
+  level: info              # debug | info | warn | error
+  format: text             # text | json
+
+status:
+  socket: /run/tunsel/tunsel.sock   # directory is mounted in the container
+metrics:
+  listen: ""               # phase 3; must stay empty for now
