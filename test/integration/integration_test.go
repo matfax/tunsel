@@ -241,7 +241,7 @@ func (d *daemon) write(t *testing.T, order string) {
 }
 
 func (d *daemon) state(tunnel string) string {
-	r, err := status.Fetch(d.socket)
+	r, err := status.Fetch(d.socket, status.Request{})
 	if err != nil {
 		return err.Error()
 	}
@@ -255,7 +255,7 @@ func (d *daemon) state(tunnel string) string {
 
 func (d *daemon) report(t *testing.T) *status.Report {
 	t.Helper()
-	r, err := status.Fetch(d.socket)
+	r, err := status.Fetch(d.socket, status.Request{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -302,7 +302,43 @@ func TestEndToEnd(t *testing.T) {
 		}
 	})
 
+	t.Run("statistics", func(t *testing.T) {
+		r, err := status.Fetch(d.socket, status.Request{Flows: true, History: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		a, b := r.Tunnels[0], r.Tunnels[1]
+		// The pings above: static via wg-a, default via wg-b from the LAN
+		// and from the router, one excluded.
+		if a.Static < 1 || b.Default < 2 || r.Connections.Excluded < 1 || r.Connections.New < a.Static+b.Default+r.Connections.Excluded {
+			t.Errorf("connections: %+v, wg-a static %d, wg-b default %d", r.Connections, a.Static, b.Default)
+		}
+		if b.Upstream.Packets == 0 {
+			t.Errorf("no upstream packets restored into wg-b: %+v", b.Upstream)
+		}
+		// The ping flows are still in conntrack.
+		if r.Flows == nil {
+			t.Fatalf("no flows: %v", r.Warnings)
+		}
+		top := map[string]bool{}
+		for _, x := range r.Flows.Tunnels["wg-a"].Top {
+			top[x.Addr.String()] = true
+		}
+		if !top[dstStatic] || r.Flows.Tunnels["wg-b"].Flows == 0 || r.Flows.Other == 0 {
+			t.Errorf("flows: %+v", r.Flows)
+		}
+		for _, tun := range r.Tunnels {
+			if l := tun.Latency; len(l) != 1 || l[0].Avg == 0 || l[0].Loss != 0 || len(tun.History) != 1 {
+				t.Errorf("%s latency: %+v, history %d", tun.Name, l, len(tun.History))
+			}
+		}
+		if a.Ranges.IPv4 != 256 || r.Exclude.IPv4 != 1<<24 {
+			t.Errorf("ranges: wg-a %+v, exclude %+v", a.Ranges, r.Exclude)
+		}
+	})
+
 	t.Run("failover with conntrack flush", func(t *testing.T) {
+		before := d.report(t)
 		// A long-running flow pinned to wg-b.
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -326,10 +362,20 @@ func TestEndToEnd(t *testing.T) {
 		}
 		cancel()
 
+		if l := d.report(t).Tunnels[1].Latency[0]; l.Loss == 0 {
+			t.Errorf("wg-b probes lost but not reported: %+v", l)
+		}
+
 		sh(t, nsB, "nft flush chain inet c in")
 		eventually(t, "wg-b recovered", func() bool { return d.state("wg-b") == "healthy" })
 		if got := via(t, nsLAN, ping(dstDefault)); got != "wg-b" {
 			t.Errorf("after recovery via %s, want wg-b", got)
+		}
+		// Failover and recovery replaced the table twice; the counters carry on.
+		after := d.report(t)
+		if after.Tunnels[0].Static < before.Tunnels[0].Static || after.Connections.Excluded < before.Connections.Excluded {
+			t.Errorf("counters lost on table replacement: before %+v / %d, after %+v / %d",
+				before.Connections, before.Tunnels[0].Static, after.Connections, after.Tunnels[0].Static)
 		}
 	})
 

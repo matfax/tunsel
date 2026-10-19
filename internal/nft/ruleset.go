@@ -5,32 +5,41 @@
 // coexists with other mark users on any kernel. Maps hold verdicts (goto
 // that chain) rather than mark values.
 //
+// Named counters record how new connections were decided (new, local,
+// excluded, static_<tunnel>, default_<tunnel>) and the upstream packets
+// restored per tunnel (restore_<tunnel>). Apply seeds them with the values
+// of the table it replaces, so they count from the first install rather
+// than from the last change.
+//
 //	table inet tunsel {
+//	  counter new; counter local; counter excluded
+//	  counter static_<tunnel>; counter default_<tunnel>; counter restore_<tunnel>
 //	  set ingress   { type ifname; }
 //	  set exclude4  { type ipv4_addr; flags interval; }
 //	  set exclude6  { type ipv6_addr; flags interval; }
-//	  map static4   { type ipv4_addr : verdict; flags interval; }
+//	  map static4   { type ipv4_addr : verdict; flags interval; }   # goto static_<tunnel>
 //	  map static6   { type ipv6_addr : verdict; flags interval; }
 //
 //	  chain to_<tunnel> {   # one per tunnel
 //	    meta mark set meta mark & ~mask | <mark>
 //	    ct mark set ct mark & ~mask | <mark>
 //	  }
-//	  chain pick4 { goto to_<default v4 tunnel> }
-//	  chain pick6 { goto to_<default v6 tunnel> }
+//	  chain static_<tunnel> { counter name static_<tunnel> goto to_<tunnel> }
+//	  chain pick4 { counter name default_<tunnel> goto to_<default v4 tunnel> }
+//	  chain pick6 { counter name default_<tunnel> goto to_<default v6 tunnel> }
 //
 //	  chain decide {
-//	    fib daddr type { local, broadcast, multicast } return
-//	    ip  daddr @exclude4 return
-//	    ip6 daddr @exclude6 return
+//	    fib daddr type { local, broadcast, multicast } counter name local return
+//	    ip  daddr @exclude4 counter name excluded return
+//	    ip6 daddr @exclude6 counter name excluded return
 //	    ip  daddr vmap @static4
 //	    ip6 daddr vmap @static6
 //	    meta nfproto ipv4 goto pick4
 //	    meta nfproto ipv6 goto pick6
 //	  }
 //	  chain steer {
-//	    ct state new goto decide
-//	    ct mark & mask == <mark> goto to_<tunnel>   # restore, one per tunnel
+//	    ct state new counter name new goto decide
+//	    ct mark & mask == <mark> counter name restore_<tunnel> goto to_<tunnel>   # one per tunnel
 //	  }
 //	  chain prerouting {   # filter hook prerouting priority mangle
 //	    iifname @ingress jump steer   # replies arriving on tunnels are never touched
@@ -78,8 +87,14 @@ type Tunnel struct {
 
 // ChainName returns the name of the chain that applies a tunnel's mark.
 func ChainName(tunnel string) string {
-	return "to_" + unsafeChars.ReplaceAllString(tunnel, "_")
+	return "to_" + safeName(tunnel)
 }
+
+// staticChain returns the name of the chain that counts a tunnel's static
+// matches before applying its mark.
+func staticChain(tunnel string) string { return "static_" + safeName(tunnel) }
+
+func safeName(tunnel string) string { return unsafeChars.ReplaceAllString(tunnel, "_") }
 
 var unsafeChars = regexp.MustCompile(`[^A-Za-z0-9_]`)
 
@@ -103,12 +118,18 @@ func (m *Manager) Apply(rs *Ruleset, alsoDelete ...string) error {
 	if err != nil {
 		return fmt.Errorf("list tables: %w", err)
 	}
+	var seed map[string]Counter
 	for _, t := range existing {
+		if t.Name == rs.Table {
+			if seed, err = readCounters(c, t); err != nil {
+				return fmt.Errorf("read counters: %w", err)
+			}
+		}
 		if t.Name == rs.Table || contains(alsoDelete, t.Name) {
 			c.DelTable(t)
 		}
 	}
-	if err := build(c, rs); err != nil {
+	if err := build(c, rs, seed); err != nil {
 		return err
 	}
 	if err := c.Flush(); err != nil {
@@ -207,8 +228,9 @@ func (rs *Ruleset) check() error {
 	return nil
 }
 
-func build(c *nftables.Conn, rs *Ruleset) error {
+func build(c *nftables.Conn, rs *Ruleset, seed map[string]Counter) error {
 	b := &builder{c: c, rs: rs, t: c.AddTable(&nftables.Table{Family: nftables.TableFamilyINet, Name: rs.Table})}
+	b.counters(seed)
 	// Tunnel chains come first: map elements and rules jump to them.
 	b.tunnelChains()
 	s, err := b.addSets()
@@ -252,6 +274,10 @@ func (b *builder) tunnelChains() {
 			&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4, Mask: notMask, Xor: ne32(tun.Mark)},
 			&expr.Ct{Key: expr.CtKeyMARK, SourceRegister: true, Register: 1})
 	}
+	// Static map elements jump here, so matches are counted per tunnel.
+	for _, tun := range b.rs.Tunnels {
+		b.rule(b.chain(staticChain(tun.Name)), count(StaticCounter(tun.Name)), gotoTunnel(tun.Name))
+	}
 }
 
 func (b *builder) addSets() (sets, error) {
@@ -274,8 +300,8 @@ func (b *builder) addSets() (sets, error) {
 		{s.ingress, ifs},
 		{s.exclude4, intervals(rs.Exclude4, nil)},
 		{s.exclude6, intervals(rs.Exclude6, nil)},
-		{s.static4, intervals(rs.Static4, gotoTunnel)},
-		{s.static6, intervals(rs.Static6, gotoTunnel)},
+		{s.static4, intervals(rs.Static4, gotoStatic)},
+		{s.static6, intervals(rs.Static6, gotoStatic)},
 	} {
 		if err := addSet(b.c, e.set, e.elems); err != nil {
 			return sets{}, fmt.Errorf("set %s: %w", e.set.Name, err)
@@ -288,10 +314,10 @@ func (b *builder) addSets() (sets, error) {
 func (b *builder) decideChain(s sets) *nftables.Chain {
 	pick4, pick6 := b.chain("pick4"), b.chain("pick6")
 	if b.rs.Default4 != "" {
-		b.rule(pick4, gotoTunnel(b.rs.Default4))
+		b.rule(pick4, count(DefaultCounter(b.rs.Default4)), gotoTunnel(b.rs.Default4))
 	}
 	if b.rs.Default6 != "" {
-		b.rule(pick6, gotoTunnel(b.rs.Default6))
+		b.rule(pick6, count(DefaultCounter(b.rs.Default6)), gotoTunnel(b.rs.Default6))
 	}
 
 	decide := b.chain("decide")
@@ -299,13 +325,16 @@ func (b *builder) decideChain(s sets) *nftables.Chain {
 		b.rule(decide,
 			&expr.Fib{Register: 1, FlagDADDR: true, ResultADDRTYPE: true},
 			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ne32(typ)},
+			count(CounterLocal),
 			&expr.Verdict{Kind: expr.VerdictReturn})
 	}
 	b.rule(decide, append(daddr(unix.NFPROTO_IPV4),
 		&expr.Lookup{SourceRegister: 1, SetName: s.exclude4.Name, SetID: s.exclude4.ID},
+		count(CounterExcluded),
 		&expr.Verdict{Kind: expr.VerdictReturn})...)
 	b.rule(decide, append(daddr(unix.NFPROTO_IPV6),
 		&expr.Lookup{SourceRegister: 1, SetName: s.exclude6.Name, SetID: s.exclude6.ID},
+		count(CounterExcluded),
 		&expr.Verdict{Kind: expr.VerdictReturn})...)
 	b.rule(decide, append(daddr(unix.NFPROTO_IPV4),
 		&expr.Lookup{SourceRegister: 1, DestRegister: 0, IsDestRegSet: true, SetName: s.static4.Name, SetID: s.static4.ID})...)
@@ -324,12 +353,14 @@ func (b *builder) steerChain(decide *nftables.Chain) *nftables.Chain {
 		&expr.Ct{Key: expr.CtKeySTATE, Register: 1},
 		&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4, Mask: ne32(expr.CtStateBitNEW), Xor: ne32(0)},
 		&expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: ne32(0)},
+		count(CounterNew),
 		&expr.Verdict{Kind: expr.VerdictGoto, Chain: decide.Name})
 	for _, tun := range b.rs.Tunnels {
 		b.rule(steer,
 			&expr.Ct{Key: expr.CtKeyMARK, Register: 1},
 			&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4, Mask: ne32(b.rs.Mask), Xor: ne32(0)},
 			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ne32(tun.Mark)},
+			count(RestoreCounter(tun.Name)),
 			gotoTunnel(tun.Name))
 	}
 	return steer
@@ -412,6 +443,10 @@ func largeBuffers(conn *netlink.Conn) error {
 
 func gotoTunnel(name string) *expr.Verdict {
 	return &expr.Verdict{Kind: expr.VerdictGoto, Chain: ChainName(name)}
+}
+
+func gotoStatic(name string) *expr.Verdict {
+	return &expr.Verdict{Kind: expr.VerdictGoto, Chain: staticChain(name)}
 }
 
 func nfproto(p byte) []expr.Any {

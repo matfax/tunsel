@@ -1,0 +1,26 @@
+#!/bin/sh
+# rpcd exec plugin, installed by luci-app-tunsel as /usr/libexec/rpcd/tunsel:
+# publishes `tunsel status -json` on ubus as object "tunsel" for the LuCI
+# status page. Methods: status, flows (adds conntrack flows per tunnel),
+# history (adds the RTT history per health target).
+
+case "$1" in
+list)
+	echo '{ "status": {}, "flows": {}, "history": {} }'
+	;;
+call)
+	case "$2" in
+	status) set -- ;;
+	flows) set -- -flows ;;
+	history) set -- -history ;;
+	*) exit 2 ;;
+	esac
+	if ! out=$(/usr/sbin/tunsel status -json "$@" 2>&1); then
+		. /usr/share/libubox/jshn.sh
+		json_init
+		json_add_string error "$out"
+		out=$(json_dump)
+	fi
+	echo "$out"
+	;;
+esac

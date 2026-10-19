@@ -1,0 +1,8 @@
+#!/bin/sh
+# Makes rpcd load the new ACL and plugin and LuCI rebuild its menu (as
+# packages built with luci.mk do).
+[ -n "${IPKG_INSTROOT}" ] && exit 0
+rm -f /tmp/luci-indexcache /tmp/luci-indexcache.*
+rm -rf /tmp/luci-modulecache/
+killall -HUP rpcd 2>/dev/null
+exit 0

@@ -1,0 +1,14 @@
+{
+	"luci-app-tunsel": {
+		"description": "Grant access to tunsel status and configuration",
+		"read": {
+			"ubus": {
+				"tunsel": [ "status", "flows", "history" ]
+			},
+			"uci": [ "tunsel" ]
+		},
+		"write": {
+			"uci": [ "tunsel" ]
+		}
+	}
+}

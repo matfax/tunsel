@@ -17,6 +17,7 @@ import (
 
 	"github.com/matfax/tunsel/internal/config"
 	"github.com/matfax/tunsel/internal/engine"
+	"github.com/matfax/tunsel/internal/flows"
 	"github.com/matfax/tunsel/internal/health"
 	"github.com/matfax/tunsel/internal/nft"
 	"github.com/matfax/tunsel/internal/status"
@@ -25,6 +26,9 @@ import (
 // ReconcileInterval is how often the daemon checks that its table still
 // exists (e.g. after another tool flushed the whole ruleset).
 const ReconcileInterval = 15 * time.Second
+
+// FlowsMaxAge is how long a conntrack dump answers flow requests.
+const FlowsMaxAge = 5 * time.Second
 
 type Options struct {
 	ConfigPath string
@@ -38,6 +42,8 @@ type Options struct {
 	// FlushConntrack deletes conntrack entries whose mark matches
 	// mark/mask. Defaults to netlink.
 	FlushConntrack func(mark, mask uint32) error
+	// DumpFlows reads the conntrack table. Defaults to netlink.
+	DumpFlows func() ([]flows.Entry, error)
 }
 
 // Tables is the nftables side; *nft.Manager in production.
@@ -46,6 +52,7 @@ type Tables interface {
 	Exists(table string) (bool, error)
 	Delete(table string) error
 	Defaults(table string) (v4, v6 string, err error)
+	Counters(table string) (map[string]nft.Counter, error)
 }
 
 type Daemon struct {
@@ -68,6 +75,7 @@ type Daemon struct {
 	apply    status.Apply
 
 	events chan health.Event
+	flows  *flows.Cache
 }
 
 func New(cfg *config.Config, opts Options) *Daemon {
@@ -77,7 +85,13 @@ func New(cfg *config.Config, opts Options) *Daemon {
 	if opts.FlushConntrack == nil {
 		opts.FlushConntrack = flushConntrack
 	}
-	return &Daemon{opts: opts, log: opts.Log, cfg: cfg, events: make(chan health.Event, 16)}
+	if opts.DumpFlows == nil {
+		opts.DumpFlows = flows.Dump
+	}
+	return &Daemon{
+		opts: opts, log: opts.Log, cfg: cfg, events: make(chan health.Event, 16),
+		flows: &flows.Cache{MaxAge: FlowsMaxAge, Dump: opts.DumpFlows},
+	}
 }
 
 // Run runs until ctx is done or SIGINT/SIGTERM. SIGHUP reloads the
@@ -322,26 +336,73 @@ func (d *Daemon) shutdown() error {
 	return nil
 }
 
-func (d *Daemon) report() status.Report {
+func (d *Daemon) report(req status.Request) status.Report {
 	d.mu.Lock()
-	defer d.mu.Unlock()
+	cfg := d.cfg
 	r := status.Report{
-		Version: d.opts.Version, Config: d.opts.ConfigPath, Table: d.cfg.NFT.Table,
+		Version: d.opts.Version, Config: d.opts.ConfigPath, Table: cfg.NFT.Table,
 		StartedAt: d.started, Default4: d.defaults.V4, Default6: d.defaults.V6,
-		Apply: d.apply, Sizes: map[string]int{},
+		Apply: d.apply,
 	}
-	for _, t := range d.cfg.Tunnels {
-		var snap health.Snapshot
+	var cover engine.Coverage
+	if d.applied != nil {
+		cover = engine.Cover(cfg, d.applied)
+	}
+	for _, t := range cfg.Tunnels {
+		tr := status.Tunnel{Name: t.Name, Mark: t.Mark, Ranges: cover.Static[t.Name]}
 		if m := d.monitors[t.Name]; m != nil {
-			snap = m.Snapshot()
+			tr.Snapshot = m.Snapshot()
+			if req.History {
+				tr.History = m.History()
+			}
 		}
-		r.Tunnels = append(r.Tunnels, status.Tunnel{Name: t.Name, Mark: t.Mark, Snapshot: snap})
+		r.Tunnels = append(r.Tunnels, tr)
 	}
-	if rs := d.applied; rs != nil {
-		r.Sizes["exclude4"], r.Sizes["exclude6"] = len(rs.Exclude4), len(rs.Exclude6)
-		r.Sizes["static4"], r.Sizes["static6"] = len(rs.Static4), len(rs.Static6)
+	r.Exclude = cover.Exclude
+	d.mu.Unlock()
+
+	// Netlink reads happen outside the lock, so a slow conntrack dump never
+	// holds up health transitions.
+	if cs, err := d.opts.NFT.Counters(cfg.NFT.Table); err != nil {
+		r.Warnings = append(r.Warnings, "counters: "+err.Error())
+	} else {
+		addCounters(&r, cs)
+	}
+	if req.Flows {
+		marks := map[uint32]string{}
+		for _, t := range cfg.Tunnels {
+			marks[t.Mark] = t.Name
+		}
+		if s, err := d.flows.Get(cfg.NFT.MarkMask, marks); err != nil {
+			r.Warnings = append(r.Warnings, "flows: "+err.Error())
+		} else {
+			r.Flows = &status.Flows{At: s.At, Tunnels: s.Tunnels, Other: s.Other}
+		}
 	}
 	return r
+}
+
+// addCounters fills in the connection and traffic counters of r from the
+// table's named counters. New connections are counted once on entry and
+// once for the decision; those that match no decision stayed unmarked.
+func addCounters(r *status.Report, cs map[string]nft.Counter) {
+	c := &r.Connections
+	c.New = cs[nft.CounterNew].Packets
+	c.Local = cs[nft.CounterLocal].Packets
+	c.Excluded = cs[nft.CounterExcluded].Packets
+	decided := c.Local + c.Excluded
+	for i := range r.Tunnels {
+		t := &r.Tunnels[i]
+		t.Static = cs[nft.StaticCounter(t.Name)].Packets
+		t.Default = cs[nft.DefaultCounter(t.Name)].Packets
+		t.Upstream = cs[nft.RestoreCounter(t.Name)]
+		decided += t.Static + t.Default
+	}
+	// The dump is not atomic: a connection may already be counted as
+	// decided but not yet as new.
+	if c.New > decided {
+		c.Unmarked = c.New - decided
+	}
 }
 
 func flushConntrack(mark, mask uint32) error {

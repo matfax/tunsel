@@ -98,7 +98,7 @@ jobs:
       - name: build packages
         run: task ipk ${{ startsWith(github.ref, 'refs/tags/v') && 'VERSION=$GITHUB_REF_NAME' || '' }}
       - name: install and run on OpenWrt (procd)
-        run: packaging/openwrt/smoke-test.sh bin/tunsel_*_x86_64.ipk
+        run: packaging/openwrt/smoke-test.sh bin/tunsel_*_x86_64.ipk bin/luci-app-tunsel_*_all.ipk
       - name: attach to release
         if: startsWith(github.ref, 'refs/tags/v')
         env:
