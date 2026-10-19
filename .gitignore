@@ -1,3 +1,4 @@
 bin/
 unit.log
 integration.log
+.code-graph/
