@@ -10,10 +10,12 @@
 
 // Reads the daemon's report through the rpcd plugin (ubus object "tunsel",
 // which runs `tunsel status -json`). Flows are polled with the report; the
-// RTT history, which changes once per probe interval, less often.
+// RTT history, which changes once per probe interval, less often. Without
+// reject, a failed ubus call (plugin missing, timeout, denied) resolves to
+// the expect default {} instead of an error.
 
-const callFlows = rpc.declare({ object: 'tunsel', method: 'flows', expect: { '': {} } });
-const callHistory = rpc.declare({ object: 'tunsel', method: 'history', expect: { '': {} } });
+const callFlows = rpc.declare({ object: 'tunsel', method: 'flows', expect: { '': {} }, reject: true });
+const callHistory = rpc.declare({ object: 'tunsel', method: 'history', expect: { '': {} }, reject: true });
 
 const SVGNS = 'http://www.w3.org/2000/svg';
 // Counts from here on are shown in magnitude only (IPv6 /64s); JSON
@@ -175,9 +177,10 @@ function latencySection(history) {
 	const rows = [];
 	for (const t of history.tunnels) {
 		for (const h of t.history ?? []) {
-			const ok = h.samples.filter((s) => s.ok);
+			const samples = h.samples ?? [];
+			const ok = samples.filter((s) => s.ok);
 			const hi = ok.reduce((m, s) => Math.max(m, s.rtt_ms), 0);
-			rows.push([ t.name, h.target, sparkline(h.samples), ok.length ? _('max %s').format(ms(hi)) : _('no answers') ]);
+			rows.push([ t.name, h.target, sparkline(samples), ok.length ? _('max %s').format(ms(hi)) : _('no answers') ]);
 		}
 	}
 	return E('div', { 'class': 'cbi-section' }, [
@@ -192,7 +195,7 @@ function topSection(r) {
 		return E('div');
 	const rows = [];
 	const groups = flowGroups(r);
-	for (const t of r.tunnels)
+	for (const t of r.tunnels ?? [])
 		for (const d of groups.get(t.name)?.top ?? [])
 			rows.push([ t.name, d.addr, count(d.flows), bytes(d.bytes) ]);
 	return E('div', { 'class': 'cbi-section' }, [
@@ -215,7 +218,7 @@ function report(r, history) {
 		E('div', { 'class': 'cbi-section' }, [
 			E('h3', {}, [ text(_('Tunnels')) ]),
 			table([ _('Tunnel'), _('State'), _('Latency'), _('New connections'), _('Active flows'), _('Traffic'), _('Static preferences') ],
-				r.tunnels.map((t) => tunnelRow(r, groups, t)))
+				(r.tunnels ?? []).map((t) => tunnelRow(r, groups, t)))
 		]),
 		latencySection(history),
 		topSection(r)
@@ -223,7 +226,7 @@ function report(r, history) {
 }
 
 function fetchFlows() {
-	return L.resolveDefault(callFlows(), { error: _('rpcd plugin not reachable') });
+	return callFlows().catch((e) => ({ error: e.message }));
 }
 
 return view.extend({
@@ -246,7 +249,7 @@ return view.extend({
 		}, 5);
 
 		return E('div', {}, [
-			E('h2', {}, [ text(_('tunsel')) ]),
+			E('h2', {}, [ text(_('Tunsel')) ]),
 			E('p', { 'class': 'cbi-map-descr' }, [ text(_('Health, latency and traffic of the steered tunnels. Counters run since the nftables table was created, normally since boot.')) ]),
 			node
 		]);

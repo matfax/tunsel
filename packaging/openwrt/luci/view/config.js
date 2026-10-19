@@ -163,7 +163,7 @@ return view.extend({
 	load: () => uci.load('tunsel'),
 
 	render: () => {
-		const m = new form.Map('tunsel', _('tunsel'),
+		const m = new form.Map('tunsel', _('Tunsel'),
 			_('Health-aware selection between VPN tunnels. Per tunnel, the router must provide a routing table with a default route via the tunnel and a rule "fwmark MARK/MASK lookup TABLE". Unmarked traffic falls through to normal routing.'));
 
 		const main = m.section(form.NamedSection, 'main', 'tunsel', _('General'));

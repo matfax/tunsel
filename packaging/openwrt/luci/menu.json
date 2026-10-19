@@ -1,6 +1,6 @@
 {
 	"admin/services/tunsel": {
-		"title": "tunsel",
+		"title": "Tunsel",
 		"order": 60,
 		"action": {
 			"type": "alias",

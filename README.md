@@ -49,7 +49,7 @@ last line of `opkg print-architecture`; `arm_cortex-a9_vfpv3-d16` on a Turris
 Omnia) and `luci-app-tunsel_<version>_all.ipk`. The first installs the
 binary, a procd service, the UCI config `/etc/config/tunsel` (disabled, with
 placeholder tunnels) and the nftables/conntrack kernel modules it needs; the
-second adds Services → tunsel to LuCI, with a configuration page and a status
+second adds Services → Tunsel to LuCI, with a configuration page and a status
 page (health, latency history, connections and flows per tunnel):
 
 ```sh
