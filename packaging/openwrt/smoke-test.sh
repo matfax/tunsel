@@ -12,15 +12,24 @@ ipk=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 image=${OPENWRT_IMAGE:-openwrt/rootfs:x86_64-24.10.4}
 name=tunsel-smoke-$$
 
-docker run -d --name "$name" --privileged -v "$ipk:/root/tunsel.ipk:ro" "$image" /sbin/init >/dev/null
+# Booting takes eth0 down (preinit) and netifd would move it into br-lan, so
+# the network and firewall services stay off and Docker's address and route
+# are restored once procd is up: the feeds are reached through them.
+docker run -d --name "$name" --privileged -v "$ipk:/root/tunsel.ipk:ro" "$image" \
+	sh -c 'rm -f /etc/rc.d/S*network /etc/rc.d/S*firewall && exec /sbin/init' >/dev/null
 trap 'docker rm -f "$name" >/dev/null' EXIT
+net=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}/{{.IPPrefixLen}} {{.Gateway}}{{end}}' "$name")
 
-docker exec -i "$name" sh -eu <<'EOF'
+docker exec -i -e NET="$net" "$name" sh -eu <<'EOF'
 fail() { echo "FAIL: $*" >&2; logread | grep tunsel >&2 || true; exit 1; }
 pid() { ubus call service list '{"name":"tunsel"}' | sed -n 's/.*"pid": \([0-9]*\).*/\1/p'; }
 
 # procd, ubus and logd come up asynchronously.
 i=0; until ubus list service >/dev/null 2>&1 && ubus list log >/dev/null 2>&1; do i=$((i+1)); [ $i -lt 30 ] || fail "procd not up"; sleep 1; done
+set -- $NET
+ip link set eth0 up
+ip addr replace "$1" dev eth0
+ip route replace default via "$2"
 
 mkdir -p /var/lock
 opkg update >/dev/null
