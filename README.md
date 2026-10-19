@@ -42,6 +42,22 @@ config rule
 
 ## Run
 
+OpenWrt / Turris OS: each release has an `.ipk` per architecture (pick the
+last line of `opkg print-architecture`; `arm_cortex-a9_vfpv3-d16` on a Turris
+Omnia). It installs the binary, a procd service (enabled, but idle until a
+config exists) and the nftables/conntrack kernel modules it needs:
+
+```sh
+opkg update && opkg install ./tunsel_<version>_<arch>.ipk
+cp /etc/tunsel/config.example.yaml /etc/tunsel/config.yaml   # edit
+/etc/init.d/tunsel start
+tunsel status
+/etc/init.d/tunsel reload            # validate, then SIGHUP
+logread -e tunsel
+```
+
+The config is never replaced or removed by opkg and is kept by sysupgrade.
+
 Container (host network; see DESIGN.md §9.1 for the runtime contract):
 
 ```sh
@@ -55,6 +71,7 @@ Natively:
 
 ```sh
 make armv7                           # bin/tunsel-armv7, static, for Turris Omnia
+make ipk IPK_ARCHS=arm_cortex-a9_vfpv3-d16   # bin/*.ipk
 tunsel check -config /etc/tunsel/config.yaml
 tunsel run -config /etc/tunsel/config.yaml
 tunsel status
@@ -66,5 +83,6 @@ tunsel status
 make test                            # unit tests (nft tests skip without root)
 sudo make integration                # all tests incl. network-namespace end-to-end test
 make image                           # local image for the build host's platform
+packaging/openwrt/smoke-test.sh bin/tunsel_*_x86_64.ipk   # ipk on OpenWrt with procd (Docker)
 ```
 

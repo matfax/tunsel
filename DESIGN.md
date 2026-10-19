@@ -156,7 +156,7 @@ Health filtering is applied when materializing 2–4, so a dead tunnel is never 
 - Language: Go, static binary, no cgo. Libraries: `github.com/google/nftables`, a netlink conntrack client.
 - Targets: `linux/arm/v7`, `linux/arm64`, `linux/amd64`.
 - Container: see 9.1.
-- Also runnable natively as a service (procd, systemd).
+- Also runnable natively as a service: OpenWrt package with a procd service (9.2), or systemd.
 - Config: YAML, validated at start (unknown keys are errors); `SIGHUP` reloads. A reload keeps the health state of tunnels whose configuration is unchanged. `status.socket` and `log.format` changes need a restart.
 - CLI: `tunsel run -config <path>`, `tunsel check -config <path>`, `tunsel status [-socket <path>] [-json]`, `tunsel version`.
 
@@ -205,6 +205,26 @@ services:
 
 Reload: `docker kill -s HUP tunsel`.
 
+### 9.2 OpenWrt package
+
+For OpenWrt and Turris OS, where Docker support is limited. Built without the SDK by `packaging/openwrt/build-ipk.sh` (`make ipk`), in the SDK's format; CI attaches one package per architecture to each `v*` release.
+
+- Architectures: opkg names mapped to the three Go targets (`arm_cortex-a*` → `arm/v7`, `aarch64_*` → `arm64`, `x86_64` → `amd64`); `IPK_ARCHS` in the Makefile lists the released ones.
+- Depends: `kmod-nft-core`, `kmod-nft-fib`, `kmod-nf-conntrack-netlink` (ctnetlink is not part of a default image).
+- Files: `/usr/sbin/tunsel`, `/etc/init.d/tunsel`, `/etc/tunsel/config.example.yaml`, `/lib/upgrade/keep.d/tunsel`.
+- Config: `/etc/tunsel/config.yaml` is not part of the package, so opkg never replaces or removes it; `keep.d` keeps it across sysupgrade.
+- Version: the tag without `v`; untagged builds are `0~<git describe>`, so they sort below every release.
+
+| Aspect | Behavior |
+|---|---|
+| Install | Service enabled and started (SDK default scripts); without a config, start is a no-op with a hint |
+| Start | `tunsel check` first, so an invalid config fails at the caller instead of in a respawn loop; procd respawns on crashes |
+| Reload | `tunsel check`, then `SIGHUP`; an invalid config is reported and the daemon keeps the previous one |
+| Stop | `SIGTERM`, 10 s before `SIGKILL` (`cleanup_on_exit`) |
+| Upgrade | Stopped and restarted on the new binary; the enabled state is kept |
+| Logs | stdout/stderr to logd (`logread -e tunsel`) |
+| Status | `/run` links to `/var/run` (tmpfs), so the default socket path works |
+
 ## 10. Observability
 
 - Structured logs: health transitions, default switches, learned decisions (with measured values).
@@ -222,4 +242,5 @@ Reload: `docker kill -s HUP tunsel`.
 - Unit tests: config validation, prefix flattening, decision logic, hysteresis, monitor rounds.
 - nft tests (root): the ruleset is installed in a throwaway network namespace and compared against `nft list` output.
 - Integration test (root, `-tags integration`): LAN client, router, two veth "tunnels" to provider namespaces and a WAN namespace. Per-provider counters assert the path of: default, static and excluded destinations, local output, failover (probes dropped) including a running flow moved by the conntrack flush, recovery, link down with the policy route lost, reload (valid and invalid) and clean shutdown. IPv6 checks are skipped on hosts booted with `ipv6.disable=1`.
-- CI runs all of the above and builds the multi-arch image; it pushes on `v*` tags.
+- OpenWrt smoke test (Docker, `packaging/openwrt/smoke-test.sh`): the x86_64 package installed into an OpenWrt rootfs booted with procd, dependencies from the feeds; install, start (none, invalid and valid config), reload, upgrade, stop and removal.
+- CI runs all of the above and builds the multi-arch image and the packages; on `v*` tags it pushes the image and attaches the packages to the release.
