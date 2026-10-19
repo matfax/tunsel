@@ -207,9 +207,9 @@ Reload: `docker kill -s HUP tunsel`.
 
 ### 9.2 OpenWrt package
 
-For OpenWrt and Turris OS, where Docker support is limited. Built without the SDK by `packaging/openwrt/build-ipk.sh` (`make ipk`), in the SDK's format; CI attaches one package per architecture to each `v*` release.
+For OpenWrt and Turris OS, where Docker support is limited. Built without the SDK by `packaging/openwrt/build-ipk.sh` (`task ipk`), in the SDK's format; CI attaches one package per architecture to each `v*` release.
 
-- Architectures: opkg names mapped to the three Go targets (`arm_cortex-a*` → `arm/v7`, `aarch64_*` → `arm64`, `x86_64` → `amd64`); `IPK_ARCHS` in the Makefile lists the released ones.
+- Architectures: opkg names mapped to the three Go targets (`arm_cortex-a*` → `arm/v7`, `aarch64_*` → `arm64`, `x86_64` → `amd64`); `IPK_ARCHS` in `Taskfile.yml` lists the released ones.
 - Depends: `kmod-nft-core`, `kmod-nft-fib`, `kmod-nf-conntrack-netlink` (ctnetlink is not part of a default image).
 - Files: `/usr/sbin/tunsel`, `/etc/init.d/tunsel`, `/etc/tunsel/config.example.yaml`, `/lib/upgrade/keep.d/tunsel`.
 - Config: `/etc/tunsel/config.yaml` is not part of the package, so opkg never replaces or removes it; `keep.d` keeps it across sysupgrade.

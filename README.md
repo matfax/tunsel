@@ -67,11 +67,11 @@ docker exec tunsel /tunsel status
 docker kill -s HUP tunsel            # reload config
 ```
 
-Natively:
+Natively (builds use [Task](https://taskfile.dev); `task --list` shows all tasks):
 
 ```sh
-make armv7                           # bin/tunsel-armv7, static, for Turris Omnia
-make ipk IPK_ARCHS=arm_cortex-a9_vfpv3-d16   # bin/*.ipk
+task armv7                           # bin/tunsel-armv7, static, for Turris Omnia
+task ipk IPK_ARCHS=arm_cortex-a9_vfpv3-d16   # bin/*.ipk
 tunsel check -config /etc/tunsel/config.yaml
 tunsel run -config /etc/tunsel/config.yaml
 tunsel status
@@ -80,8 +80,8 @@ tunsel status
 ## Development
 
 ```sh
-make test                            # unit tests (nft tests skip without root)
-sudo make integration                # all tests incl. network-namespace end-to-end test
-make image                           # local image for the build host's platform
+task test                            # unit tests (nft tests skip without root)
+sudo task integration                # all tests incl. network-namespace end-to-end test
+task image                           # local image for the build host's platform
 packaging/openwrt/smoke-test.sh bin/tunsel_*_x86_64.ipk   # ipk on OpenWrt with procd (Docker)
 ```

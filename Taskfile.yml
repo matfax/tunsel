@@ -1,0 +1,57 @@
+version: '3'
+
+vars:
+  VERSION:
+    sh: git describe --tags --always --dirty 2>/dev/null || echo dev
+  LDFLAGS: -s -w -X main.version={{.VERSION}}
+  # OpenWrt / Turris OS packages, one per opkg architecture (the last line of
+  # `opkg print-architecture` on the device). Omnia, MOX, other ARMv7/ARMv8, x86.
+  IPK_ARCHS: >-
+    arm_cortex-a9_vfpv3-d16 arm_cortex-a7_neon-vfpv4 arm_cortex-a15_neon-vfpv4
+    aarch64_cortex-a53 aarch64_cortex-a72 aarch64_generic x86_64
+
+tasks:
+  default:
+    cmds:
+      - task: build
+
+  build:
+    desc: Static Linux binary for the build host's architecture (bin/tunsel)
+    env:
+      CGO_ENABLED: '0'
+      GOOS: linux   # nftables and netlink are Linux-only
+    cmds:
+      - go build -trimpath -ldflags "{{.LDFLAGS}}" -o bin/tunsel ./cmd/tunsel
+
+  armv7:
+    desc: Static binary for Turris Omnia and other ARMv7 routers (bin/tunsel-armv7)
+    env:
+      CGO_ENABLED: '0'
+      GOOS: linux
+      GOARCH: arm
+      GOARM: '7'
+    cmds:
+      - go build -trimpath -ldflags "{{.LDFLAGS}}" -o bin/tunsel-armv7 ./cmd/tunsel
+
+  ipk:
+    desc: OpenWrt packages for IPK_ARCHS (bin/*.ipk); needs sh and GNU tar
+    env:
+      LDFLAGS: '{{.LDFLAGS}}'
+    cmds:
+      - packaging/openwrt/build-ipk.sh {{.VERSION}} bin {{.IPK_ARCHS}}
+
+  test:
+    desc: go vet and unit tests (nft tests skip without root)
+    cmds:
+      - go vet ./...
+      - go test -race ./...
+
+  integration:
+    desc: All tests incl. the network-namespace end-to-end test; needs root
+    cmds:
+      - go test -count=1 -tags integration ./...
+
+  image:
+    desc: Local image for the build host's platform
+    cmds:
+      - docker build --build-arg VERSION={{.VERSION}} -t tunsel:{{.VERSION}} .
