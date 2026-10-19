@@ -1,0 +1,91 @@
+name: release
+
+# Cuts the next version from main: tests, builds, pushes and attests the image
+# and packages, then leaves a draft release with the packages attached. The
+# release goes out when the draft is published by hand; with immutable releases
+# that locks its assets and tag.
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Part of the latest release's version to bump
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+
+permissions:
+  contents: read
+
+# One release at a time, so two runs can't pick the same version.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash   # -eo pipefail
+
+jobs:
+  version:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.next.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0   # all tags
+      - id: next
+        env:
+          BUMP: ${{ inputs.bump }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          latest=$(git tag --list 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)
+          IFS=. read -r major minor patch <<<"${latest:-v0.0.0}"
+          major=${major#v}
+          case $BUMP in
+            major) version=v$((major + 1)).0.0 ;;
+            minor) version=v$major.$((minor + 1)).0 ;;
+            patch) version=v$major.$minor.$((patch + 1)) ;;
+          esac
+          # The tag only exists once a release is published, so an unpublished
+          # draft still holds this version.
+          if gh release view "$version" >/dev/null 2>&1; then
+            echo "::error::release $version already exists; publish or delete its draft first"
+            exit 1
+          fi
+          echo "${latest:-no release} -> $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    uses: ./.github/workflows/ci.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
+    secrets: inherit   # registry credentials, if set
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+
+  draft:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: packages
+          path: dist
+      - name: create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.version.outputs.version }}
+        # Publishing the draft creates the tag at the commit this run built.
+        run: |
+          gh release create "$VERSION" dist/* --draft --target "$GITHUB_SHA" \
+            --title "$VERSION" --generate-notes

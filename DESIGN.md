@@ -221,7 +221,7 @@ Reload: `docker kill -s HUP tunsel`.
 
 ### 9.2 OpenWrt package
 
-For OpenWrt and Turris OS, where Docker support is limited. Built without the SDK by `packaging/openwrt/build-ipk.sh` (`task ipk`), in the SDK's format; CI attaches one package per architecture to each `v*` release.
+For OpenWrt and Turris OS, where Docker support is limited. Built without the SDK by `packaging/openwrt/build-ipk.sh` (`task ipk`), in the SDK's format; CI attaches one package per architecture to each release.
 
 - Architectures: opkg names mapped to the three Go targets (`arm_cortex-a*` → `arm/v7`, `aarch64_*` → `arm64`, `x86_64` → `amd64`); `IPK_ARCHS` in `Taskfile.yml` lists the released ones.
 - Depends: `kmod-nft-core`, `kmod-nft-fib`, `kmod-nf-conntrack-netlink` (ctnetlink is not part of a default image).
@@ -259,4 +259,4 @@ For OpenWrt and Turris OS, where Docker support is limited. Built without the SD
 - nft tests (root): the ruleset is installed in a throwaway network namespace and compared against `nft list` output.
 - Integration test (root, `-tags integration`): LAN client, router, two veth "tunnels" to provider namespaces and a WAN namespace. Per-provider counters assert the path of: default, static and excluded destinations, local output, failover (probes dropped) including a running flow moved by the conntrack flush, recovery, link down with the policy route lost, reload (valid and invalid) and clean shutdown. IPv6 checks are skipped on hosts booted with `ipv6.disable=1`.
 - OpenWrt smoke test (Docker, `packaging/openwrt/smoke-test.sh`): the x86_64 package and `luci-app-tunsel` installed into an OpenWrt rootfs booted with procd, dependencies from the feeds; install (disabled), start (invalid and valid config), reload (explicit and by `reload_config`), disable and enable, the rpcd plugin's methods, upgrade (config kept), stop and removal.
-- CI runs all of the above and builds the multi-arch image and the packages; on `v*` tags it pushes the image and attaches the packages to the release.
+- CI runs all of the above and builds the multi-arch image and the packages. Releases are cut by the manually run release workflow, which bumps the major, minor or patch part of the latest version, runs the same jobs, pushes and attests the image and leaves a draft release with the packages; publishing the draft creates the `v*` tag.

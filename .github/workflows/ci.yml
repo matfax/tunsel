@@ -3,8 +3,14 @@ name: ci
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   pull_request:
+  # release.yml: the same jobs, also publishing and attesting the version.
+  workflow_call:
+    inputs:
+      version:
+        description: Release version (vX.Y.Z)
+        type: string
+        required: true
 
 permissions:
   contents: read
@@ -49,7 +55,7 @@ jobs:
     permissions:
       contents: read
       packages: write
-      # Signed provenance and SBOM attestations on v* tags.
+      # Signed provenance and SBOM attestations on releases.
       id-token: write
       attestations: write
       artifact-metadata: write
@@ -65,11 +71,11 @@ jobs:
         with:
           images: ${{ env.IMAGE }}
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=semver,pattern={{version}},value=${{ inputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.version }}
+            type=raw,value=latest,enable=${{ inputs.version != '' }}
             type=sha
-      - if: startsWith(github.ref, 'refs/tags/v')
+      - if: inputs.version != ''
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
@@ -80,7 +86,7 @@ jobs:
         with:
           context: .
           platforms: linux/amd64,linux/arm64,linux/arm/v7
-          push: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          push: ${{ inputs.version != '' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: VERSION=${{ steps.meta.outputs.version }}
@@ -91,14 +97,14 @@ jobs:
       # Attestations name the pushed index by digest, so they cover every
       # platform; they are also pushed to the registry next to the image.
       - name: attest build provenance
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: inputs.version != ''
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
       - name: generate SBOM
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: inputs.version != ''
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           image: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
@@ -106,7 +112,7 @@ jobs:
           output-file: image.spdx.json
           upload-release-assets: false
       - name: attest SBOM
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: inputs.version != ''
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ${{ env.IMAGE }}
@@ -118,8 +124,8 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # release assets on v* tags
-      # Signed provenance and SBOM attestations on v* tags.
+      contents: read
+      # Signed provenance and SBOM attestations on releases.
       id-token: write
       attestations: write
       artifact-metadata: write
@@ -130,18 +136,20 @@ jobs:
           go-version-file: go.mod
       - uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
       - name: build packages
-        run: task ipk ${{ startsWith(github.ref, 'refs/tags/v') && 'VERSION=$GITHUB_REF_NAME' || '' }}
+        env:
+          VERSION: ${{ inputs.version }}
+        run: task ipk ${VERSION:+"VERSION=$VERSION"}
       - name: install and run on OpenWrt (procd)
         run: packaging/openwrt/smoke-test.sh bin/tunsel_*_x86_64.ipk bin/luci-app-tunsel_*_all.ipk
       - name: attest build provenance
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: inputs.version != ''
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: bin/*.ipk
       # One SBOM for all packages, from what they install: syft reads the Go
       # modules from each binary's build info.
       - name: unpack packages
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: inputs.version != ''
         run: |
           for ipk in bin/*.ipk; do
             dir=sbom-root/$(basename "$ipk" .ipk)
@@ -149,7 +157,7 @@ jobs:
             tar -xzOf "$ipk" ./data.tar.gz | tar -xz -C "$dir"
           done
       - name: generate SBOM
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: inputs.version != ''
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           path: sbom-root
@@ -157,16 +165,18 @@ jobs:
           output-file: bin/tunsel.spdx.json
           upload-release-assets: false
       - name: attest SBOM
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: inputs.version != ''
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: bin/*.ipk
           sbom-path: bin/tunsel.spdx.json
-      - name: attach to release
-        if: startsWith(github.ref, 'refs/tags/v')
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 ||
-            gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes
-          gh release upload "$GITHUB_REF_NAME" bin/*.ipk bin/tunsel.spdx.json --clobber
+      # release.yml attaches these to the draft release.
+      - name: keep packages for the release
+        if: inputs.version != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: packages
+          path: |
+            bin/*.ipk
+            bin/tunsel.spdx.json
+          if-no-files-found: error

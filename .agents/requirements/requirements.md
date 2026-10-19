@@ -1,6 +1,6 @@
 # Requirements
 
-<!-- reqtracker:v2 next=8 -->
+<!-- reqtracker:v2 next=9 -->
 
 > Tracked automatically from what the user stated or explicitly approved. Suggestions Claude made on its own are not recorded here.
 
@@ -11,3 +11,4 @@
 - [x] `R5` Codacy does not flag Revive's package-comments rule for this repository `+ci` `2026-10-19 → met 2026-10-19: Revive's package-comments rule is now off for this repository, re-analysis went from 4 issues to 0`
 - [ ] `R6` Codacy has Revive's package-comments rule disabled for all repositories `+ci` `2026-10-19`
 - [x] `R7` CI attests build provenance and an SBOM with actions/attest for the image and ipk packages on v* tags `+ci` `+build` `2026-10-19 → met 2026-10-19: reworded to the code and confirmed by the user before a commit`
+- [x] `R8` Codacy does not flag the id-token: write permission in the signing workflow as a hard-coded token `+ci` `2026-10-19 → met 2026-10-19: Finding marked as false positive in Codacy; fresh analysis of the PR reports 0 issues, down from 1`
