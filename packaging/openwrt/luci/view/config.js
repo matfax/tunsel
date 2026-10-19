@@ -4,8 +4,9 @@
 'require uci';
 'require tools.widgets as widgets';
 
-// Provided by LuCI's loader: the modules required above, plus L and _.
-/* global L, _, form, uci, view, widgets */
+// Provided by LuCI's loader: the modules required above, plus L (and _,
+// which ESLint already knows).
+/* global L, form, uci, view, widgets */
 
 // Mirrors the UCI schema read by the daemon (internal/config/uci.go). The
 // daemon validates everything again on reload; these checks only catch

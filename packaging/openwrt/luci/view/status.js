@@ -4,8 +4,9 @@
 'require poll';
 'require rpc';
 
-// Provided by LuCI's loader: the modules required above, plus E, L and _.
-/* global E, L, _, dom, poll, rpc, view */
+// Provided by LuCI's loader: the modules required above, plus E and L (and _,
+// which ESLint already knows).
+/* global E, L, dom, poll, rpc, view */
 
 // Reads the daemon's report through the rpcd plugin (ubus object "tunsel",
 // which runs `tunsel status -json`). Flows are polled with the report; the
