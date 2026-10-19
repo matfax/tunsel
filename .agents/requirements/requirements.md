@@ -1,6 +1,6 @@
 # Requirements
 
-<!-- reqtracker:v2 next=7 -->
+<!-- reqtracker:v2 next=8 -->
 
 > Tracked automatically from what the user stated or explicitly approved. Suggestions Claude made on its own are not recorded here.
 
@@ -10,3 +10,4 @@
 - [x] `R4` The docs describe Taskfile.yml instead of the Makefile `+docs` `+build` `2026-10-19 → met 2026-10-19: Docs say task instead of make, done by commit 347deea`
 - [x] `R5` Codacy does not flag Revive's package-comments rule for this repository `+ci` `2026-10-19 → met 2026-10-19: Revive's package-comments rule is now off for this repository, re-analysis went from 4 issues to 0`
 - [ ] `R6` Codacy has Revive's package-comments rule disabled for all repositories `+ci` `2026-10-19`
+- [x] `R7` CI attests build provenance and an SBOM with actions/attest for the image and ipk packages on v* tags `+ci` `+build` `2026-10-19 → met 2026-10-19: reworded to the code and confirmed by the user before a commit`
