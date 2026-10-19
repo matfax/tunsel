@@ -132,43 +132,48 @@ func uciTokens(line string) ([]string, error) {
 		}
 	}
 	for i := 0; i < len(line); i++ {
-		ch := line[i]
-		switch {
+		switch ch := line[i]; {
 		case ch == ' ' || ch == '\t' || ch == '\r':
 			end()
+			continue
 		case ch == '#' && !in:
 			return toks, nil
-		case ch == '\'':
-			j := strings.IndexByte(line[i+1:], '\'')
-			if j < 0 {
-				return nil, errors.New("unterminated single quote")
+		case ch == '\'' || ch == '"':
+			next, err := quoted(line, i, &cur)
+			if err != nil {
+				return nil, err
 			}
-			cur.WriteString(line[i+1 : i+1+j])
-			i += j + 1
-			in = true
-		case ch == '"':
-			i++
-			for ; i < len(line) && line[i] != '"'; i++ {
-				if line[i] == '\\' && i+1 < len(line) {
-					i++
-				}
-				cur.WriteByte(line[i])
-			}
-			if i == len(line) {
-				return nil, errors.New("unterminated double quote")
-			}
-			in = true
+			i = next
 		case ch == '\\' && i+1 < len(line):
 			i++
 			cur.WriteByte(line[i])
-			in = true
 		default:
 			cur.WriteByte(ch)
-			in = true
 		}
+		in = true
 	}
 	end()
 	return toks, nil
+}
+
+// quoted appends the quoted string starting at line[i] to cur and returns
+// the index of its closing quote. Backslash escapes apply in double quotes
+// only.
+func quoted(line string, i int, cur *strings.Builder) (int, error) {
+	q := line[i]
+	for i++; i < len(line) && line[i] != q; i++ {
+		if q == '"' && line[i] == '\\' && i+1 < len(line) {
+			i++
+		}
+		cur.WriteByte(line[i])
+	}
+	if i == len(line) {
+		if q == '"' {
+			return 0, errors.New("unterminated double quote")
+		}
+		return 0, errors.New("unterminated single quote")
+	}
+	return i, nil
 }
 
 // uciReader converts the options of one section, collecting errors.
@@ -253,6 +258,19 @@ func (r uciReader) list(o uciOption) []string {
 	return vs
 }
 
+func (r uciReader) addrs(o uciOption) []netip.Addr {
+	var as []netip.Addr
+	for _, v := range r.list(o) {
+		a, err := netip.ParseAddr(v)
+		if err != nil {
+			r.fail(o, "invalid address %q", v)
+			continue
+		}
+		as = append(as, a)
+	}
+	return as
+}
+
 func (r uciReader) prefixes(o uciOption) []Prefix {
 	var ps []Prefix
 	for _, v := range r.list(o) {
@@ -332,7 +350,6 @@ func (c *Config) tunnelFromUCI(r uciReader) {
 		t      Tunnel
 		prefer []Prefix
 	)
-	h := &t.Health
 	for _, o := range r.sec.opts {
 		switch o.name {
 		case "iface":
@@ -341,31 +358,12 @@ func (c *Config) tunnelFromUCI(r uciReader) {
 			r.setUint32(o, &t.Mark)
 		case "family":
 			t.Families = r.list(o)
-		case "target":
-			for _, v := range r.list(o) {
-				a, err := netip.ParseAddr(v)
-				if err != nil {
-					r.fail(o, "invalid address %q", v)
-					continue
-				}
-				h.Targets = append(h.Targets, a)
-			}
-		case "probe":
-			r.setString(o, &h.Probe)
-		case "interval":
-			r.setDuration(o, &h.Interval)
-		case "timeout":
-			r.setDuration(o, &h.Timeout)
-		case "min_ok":
-			r.setInt(o, &h.MinOK)
-		case "fail_after":
-			r.setInt(o, &h.FailAfter)
-		case "recover_after":
-			r.setInt(o, &h.RecoverAfter)
 		case "prefer":
 			prefer = r.prefixes(o)
 		default:
-			r.errs.fail("line %d: unknown option %q in tunnel section", o.line, o.name)
+			if !r.health(o, &t.Health) {
+				r.errs.fail("line %d: unknown option %q in tunnel section", o.line, o.name)
+			}
 		}
 	}
 	if t.Name == "" {
@@ -376,4 +374,27 @@ func (c *Config) tunnelFromUCI(r uciReader) {
 	for _, p := range prefer {
 		c.StaticPref = append(c.StaticPref, StaticPref{Prefix: p, Tunnel: t.Name})
 	}
+}
+
+// health sets the health option o and reports whether o is one.
+func (r uciReader) health(o uciOption, h *Health) bool {
+	switch o.name {
+	case "target":
+		h.Targets = append(h.Targets, r.addrs(o)...)
+	case "probe":
+		r.setString(o, &h.Probe)
+	case "interval":
+		r.setDuration(o, &h.Interval)
+	case "timeout":
+		r.setDuration(o, &h.Timeout)
+	case "min_ok":
+		r.setInt(o, &h.MinOK)
+	case "fail_after":
+		r.setInt(o, &h.FailAfter)
+	case "recover_after":
+		r.setInt(o, &h.RecoverAfter)
+	default:
+		return false
+	}
+	return true
 }
