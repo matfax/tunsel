@@ -9,7 +9,8 @@
 // typos early.
 
 // One Go duration term, e.g. "1.5s"; a duration is one or more of them.
-const DURATION_TERM = /\d+(?:\.\d+)?(?:ns|us|µs|ms|s|m|h)/y;
+// Without nested quantifiers, so matching stays linear.
+const DURATION_TERM = /\d+\.?\d*(?:ns|us|µs|ms|s|m|h)/y;
 
 function number(_sid, value) {
 	if (value === '' || /^(?:0x[\da-fA-F]+|\d+)$/.test(value))

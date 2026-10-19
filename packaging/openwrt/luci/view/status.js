@@ -41,7 +41,7 @@ function bytes(n) {
 		n /= 1024;
 		i++;
 	}
-	return `${i ? n.toFixed(1) : n} ${units[i]}`;
+	return `${i ? n.toFixed(1) : n} ${units.at(i)}`;
 }
 
 function ms(v) {
