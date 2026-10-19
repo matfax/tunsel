@@ -22,15 +22,15 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod   # caches modules and build cache, keyed on go.sum
-      - run: go vet ./... && go vet -tags integration ./...
-      - name: unit tests
-        run: go test -race ./... 2>&1 | tee unit.log
+      - uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+      - name: vet and unit tests
+        run: task test 2>&1 | tee unit.log
       - name: integration tests (root, network namespaces)
         run: |
           sudo apt-get update -q && sudo apt-get install -yq nftables conntrack iputils-ping
           # Root reuses the runner's caches instead of starting empty.
           sudo env "PATH=$PATH" GOCACHE="$(go env GOCACHE)" GOMODCACHE="$(go env GOMODCACHE)" \
-            go test -count=1 -tags integration ./... 2>&1 | tee integration.log
+            task integration 2>&1 | tee integration.log
       - name: annotate test failures
         if: failure()
         run: |
