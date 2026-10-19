@@ -31,8 +31,9 @@ type Probe struct {
 }
 
 type Prober interface {
-	// Probe returns nil if the target answered before ctx expired.
-	Probe(ctx context.Context, p Probe) error
+	// Probe returns the round-trip time, or an error if the target did not
+	// answer before ctx expired.
+	Probe(ctx context.Context, p Probe) (time.Duration, error)
 }
 
 // SocketProber sends probes from sockets bound to the tunnel device
@@ -41,7 +42,7 @@ type Prober interface {
 // leave the probes alone.
 type SocketProber struct{}
 
-func (SocketProber) Probe(ctx context.Context, p Probe) error {
+func (SocketProber) Probe(ctx context.Context, p Probe) (time.Duration, error) {
 	if p.Kind == config.ProbeTCP {
 		return probeTCP(ctx, p)
 	}
@@ -58,7 +59,9 @@ func bind(fd int, p Probe) error {
 	return nil
 }
 
-func probeTCP(ctx context.Context, p Probe) error {
+// probeTCP measures the handshake: the time until the connection is
+// established or refused.
+func probeTCP(ctx context.Context, p Probe) (time.Duration, error) {
 	var serr error
 	d := net.Dialer{Control: func(_, _ string, c syscall.RawConn) error {
 		if err := c.Control(func(fd uintptr) { serr = bind(int(fd), p) }); err != nil {
@@ -66,19 +69,21 @@ func probeTCP(ctx context.Context, p Probe) error {
 		}
 		return serr
 	}}
+	start := time.Now()
 	conn, err := d.DialContext(ctx, "tcp", netip.AddrPortFrom(p.Target, p.Port).String())
+	rtt := time.Since(start)
 	if err == nil {
 		conn.Close()
-		return nil
+		return rtt, nil
 	}
 	// A RST proves the path through the tunnel works.
 	if errors.Is(err, syscall.ECONNREFUSED) {
-		return nil
+		return rtt, nil
 	}
-	return err
+	return 0, err
 }
 
-func probeICMP(ctx context.Context, p Probe) error {
+func probeICMP(ctx context.Context, p Probe) (time.Duration, error) {
 	proto := unix.IPPROTO_ICMP
 	var echo, reply icmp.Type = ipv4.ICMPTypeEcho, ipv4.ICMPTypeEchoReply
 	if p.Target.Is6() {
@@ -87,7 +92,7 @@ func probeICMP(ctx context.Context, p Probe) error {
 	}
 	pc, err := icmpConn(p, proto)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer pc.Close()
 	if dl, ok := ctx.Deadline(); ok {
@@ -104,11 +109,12 @@ func probeICMP(ctx context.Context, p Probe) error {
 	// The kernel fills in the ICMPv6 checksum on raw sockets.
 	b, err := msg.Marshal(nil)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	dst := &net.IPAddr{IP: p.Target.AsSlice()}
+	start := time.Now()
 	if _, err := pc.WriteTo(b, dst); err != nil {
-		return fmt.Errorf("send: %w", err)
+		return 0, fmt.Errorf("send: %w", err)
 	}
 
 	buf := make([]byte, 1500)
@@ -116,13 +122,13 @@ func probeICMP(ctx context.Context, p Probe) error {
 		n, from, err := pc.ReadFrom(buf)
 		if err != nil {
 			if ctx.Err() != nil {
-				return fmt.Errorf("no reply: %w", ctx.Err())
+				return 0, fmt.Errorf("no reply: %w", ctx.Err())
 			}
-			return err
+			return 0, err
 		}
 		// net.IPConn already strips the IPv4 header of raw sockets.
 		if isReply(buf[:n], from, p.Target, proto, reply, want) {
-			return nil
+			return time.Since(start), nil
 		}
 	}
 }

@@ -144,12 +144,20 @@ const DefaultSocket = "/run/tunsel/tunsel.sock"
 type Duration time.Duration
 
 func (d *Duration) UnmarshalYAML(n *yaml.Node) error {
-	v, err := time.ParseDuration(n.Value)
+	v, err := parseDuration(n.Value)
 	if err != nil {
-		return fmt.Errorf("line %d: invalid duration %q", n.Line, n.Value)
+		return fmt.Errorf("line %d: %w", n.Line, err)
 	}
-	*d = Duration(v)
+	*d = v
 	return nil
+}
+
+func parseDuration(s string) (Duration, error) {
+	v, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("invalid duration %q", s)
+	}
+	return Duration(v), nil
 }
 
 func (d Duration) D() time.Duration { return time.Duration(d) }
@@ -201,13 +209,18 @@ func ParsePrefix(s string) (netip.Prefix, error) {
 	return p, nil
 }
 
-// Load reads, parses and validates a configuration file.
+// Load reads, parses and validates a configuration file: YAML if its name
+// ends in .yaml or .yml, UCI otherwise (/etc/config/tunsel on OpenWrt).
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	return Parse(data)
+	switch filepath.Ext(path) {
+	case ".yaml", ".yml":
+		return Parse(data)
+	}
+	return ParseUCI(data)
 }
 
 // Parse parses and validates configuration data. Unknown keys are errors.

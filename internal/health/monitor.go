@@ -30,6 +30,8 @@ type Snapshot struct {
 	Passes    int       `json:"passes"`
 	Fails     int       `json:"fails"`
 	Errors    []string  `json:"errors,omitempty"`
+	// Latency per health target over the kept history.
+	Latency []Latency `json:"latency,omitempty"`
 }
 
 // LinkState reports the administrative state of an interface.
@@ -60,6 +62,7 @@ type Monitor struct {
 	mu      sync.Mutex
 	tracker Tracker
 	snap    Snapshot
+	history []ring // per health target, in config order
 }
 
 func NewMonitor(t config.Tunnel, env Env) *Monitor {
@@ -75,6 +78,7 @@ func NewMonitor(t config.Tunnel, env Env) *Monitor {
 	return &Monitor{
 		tun: t, env: env,
 		tracker: Tracker{FailAfter: t.Health.FailAfter, RecoverAfter: t.Health.RecoverAfter},
+		history: make([]ring, len(t.Health.Targets)),
 	}
 }
 
@@ -88,6 +92,11 @@ func (m *Monitor) Adopt(old *Monitor) {
 	m.tracker.State = old.tracker.State
 	m.tracker.passes, m.tracker.fails = old.tracker.passes, old.tracker.fails
 	m.snap = old.snap
+	// The daemon adopts only unchanged tunnels, so the targets match.
+	for i := range min(len(old.history), len(m.history)) {
+		m.history[i].buf = append([]Sample(nil), old.history[i].buf...)
+		m.history[i].next = old.history[i].next
+	}
 }
 
 func (m *Monitor) Tunnel() config.Tunnel { return m.tun }
@@ -105,7 +114,21 @@ func (m *Monitor) Snapshot() Snapshot {
 	s.State = m.tracker.State
 	s.Passes, s.Fails = m.tracker.Streak()
 	s.Errors = append([]string(nil), s.Errors...)
+	for i, t := range m.tun.Health.Targets {
+		s.Latency = append(s.Latency, summarize(t, m.history[i].samples()))
+	}
 	return s
+}
+
+// History returns the kept samples per health target.
+func (m *Monitor) History() []History {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var hs []History
+	for i, t := range m.tun.Health.Targets {
+		hs = append(hs, History{Target: t, Samples: m.history[i].samples()})
+	}
+	return hs
 }
 
 // RunRound performs one probe round and reports whether the state changed.
@@ -113,8 +136,10 @@ func (m *Monitor) RunRound(ctx context.Context) (changed bool) {
 	h := m.tun.Health
 	link, _ := m.env.Link(m.tun.Name)
 	var (
-		ok   int
-		errs []string
+		ok      int
+		errs    []string
+		results = make([]error, len(h.Targets))
+		rtts    = make([]time.Duration, len(h.Targets))
 	)
 	down := link != "up"
 	if down {
@@ -126,13 +151,12 @@ func (m *Monitor) RunRound(ctx context.Context) (changed bool) {
 	if !down {
 		ctx, cancel := context.WithTimeout(ctx, h.Timeout.D())
 		defer cancel()
-		results := make([]error, len(h.Targets))
 		var wg sync.WaitGroup
 		for i, target := range h.Targets {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				results[i] = m.env.Prober.Probe(ctx, Probe{
+				rtts[i], results[i] = m.env.Prober.Probe(ctx, Probe{
 					Iface: m.tun.Name, Mark: m.tun.Mark, Target: target,
 					Kind: h.ProbeKind, Port: h.ProbePort,
 				})
@@ -157,6 +181,15 @@ func (m *Monitor) RunRound(ctx context.Context) (changed bool) {
 	}
 	m.snap.LastRound, m.snap.Link = now, link
 	m.snap.OK, m.snap.Total, m.snap.Errors = ok, len(h.Targets), errs
+	// A round skipped because the tunnel is down counts as lost for every
+	// target.
+	for i := range h.Targets {
+		s := Sample{At: now}
+		if !down && results[i] == nil {
+			s.RTT, s.OK = Millis(rtts[i]), true
+		}
+		m.history[i].add(s)
+	}
 	return changed
 }
 

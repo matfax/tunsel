@@ -23,8 +23,11 @@ const usage = `usage: tunsel <command> [flags]
 commands:
   run      run the daemon (-config path)
   check    validate a configuration file (-config path)
-  status   show daemon state (-socket path, -json)
+  status   show daemon state (-socket path, -json, -flows, -history)
   version  print the version
+
+A configuration file whose name ends in .yaml or .yml is YAML; any other
+name is read as UCI (e.g. /etc/config/tunsel on OpenWrt).
 `
 
 func main() {
@@ -89,8 +92,11 @@ func showStatus(args []string) error {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
 	socket := fs.String("socket", config.DefaultSocket, "status socket")
 	asJSON := fs.Bool("json", false, "print JSON")
+	var req status.Request
+	fs.BoolVar(&req.Flows, "flows", false, "include the conntrack flows per tunnel")
+	fs.BoolVar(&req.History, "history", false, "include the RTT history per health target")
 	fs.Parse(args)
-	r, err := status.Fetch(*socket)
+	r, err := status.Fetch(*socket, req)
 	if err != nil {
 		return err
 	}

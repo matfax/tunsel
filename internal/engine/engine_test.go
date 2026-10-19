@@ -2,6 +2,8 @@ package engine
 
 import (
 	"fmt"
+	"math"
+	"net/netip"
 	"strings"
 	"testing"
 
@@ -92,5 +94,40 @@ func TestBuild(t *testing.T) {
 	// previous default no longer in the config is not kept.
 	if _, d5 := Build(cfg, healthy(), Defaults{V4: "gone"}); d5.V4 != "" {
 		t.Errorf("stale previous default kept: %+v", d5)
+	}
+}
+
+func TestCover(t *testing.T) {
+	cfg, err := config.Parse([]byte(cfgYAML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs, _ := Build(cfg, healthy("wg-a", "wg-b", "wg-c"), Defaults{})
+	c := Cover(cfg, rs)
+	// wg-c's /25 is carved out of wg-a's /24.
+	if got := c.Static["wg-a"]; got != (RangeStats{Prefixes: 1, Ranges: 1, IPv4: 128}) {
+		t.Errorf("wg-a: %+v", got)
+	}
+	if got := c.Static["wg-c"]; got != (RangeStats{Prefixes: 2, Ranges: 2, IPv4: 128, IPv6: 1 << 16}) {
+		t.Errorf("wg-c: %+v", got)
+	}
+	if got, ok := c.Static["wg-b"]; !ok || got != (RangeStats{}) {
+		t.Errorf("wg-b: %+v %v", got, ok)
+	}
+	// 10.1.0.0/16 merges into 10.0.0.0/8.
+	if got := c.Exclude; got != (RangeStats{Prefixes: 3, Ranges: 2, IPv4: 1 << 24, IPv6: 1 << 54}) {
+		t.Errorf("exclude: %+v", got)
+	}
+
+	rs, _ = Build(cfg, healthy("wg-a", "wg-b"), Defaults{})
+	c = Cover(cfg, rs)
+	if a, cc := c.Static["wg-a"], c.Static["wg-c"]; a.IPv4 != 256 || cc != (RangeStats{Prefixes: 2}) {
+		t.Errorf("wg-c down: wg-a %+v, wg-c %+v", a, cc)
+	}
+
+	var s RangeStats
+	s.add(netip.MustParseAddr("::"), netip.MustParseAddr("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"))
+	if s.IPv6 != math.MaxUint64 {
+		t.Errorf("::/0 should saturate: %d", s.IPv6)
 	}
 }

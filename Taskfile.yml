@@ -34,7 +34,7 @@ tasks:
       - go build -trimpath -ldflags "{{.LDFLAGS}}" -o bin/tunsel-armv7 ./cmd/tunsel
 
   ipk:
-    desc: OpenWrt packages for IPK_ARCHS (bin/*.ipk); needs sh and GNU tar
+    desc: OpenWrt packages for IPK_ARCHS and luci-app-tunsel (bin/*.ipk); needs sh and GNU tar
     env:
       LDFLAGS: '{{.LDFLAGS}}'
     cmds:

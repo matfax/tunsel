@@ -48,19 +48,21 @@ func TestTracker(t *testing.T) {
 type fakeProber struct {
 	mu   sync.Mutex
 	down map[netip.Addr]bool
+	rtt  map[netip.Addr]time.Duration
 	seen []Probe
 }
 
-func (f *fakeProber) Probe(ctx context.Context, p Probe) error {
+func (f *fakeProber) Probe(ctx context.Context, p Probe) (time.Duration, error) {
 	f.mu.Lock()
 	f.seen = append(f.seen, p)
 	down := f.down[p.Target]
+	rtt := f.rtt[p.Target]
 	f.mu.Unlock()
 	if down {
 		<-ctx.Done()
-		return ctx.Err()
+		return 0, ctx.Err()
 	}
-	return nil
+	return rtt, nil
 }
 
 func tunnel() config.Tunnel {

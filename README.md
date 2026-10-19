@@ -7,7 +7,9 @@ moves back on recovery. tunsel owns one nftables table and nothing else:
 interfaces, routing tables, policy rules and the firewall stay with the host.
 
 See [DESIGN.md](DESIGN.md) for the design, the full ruleset and failure
-semantics, and [config.example.yaml](config.example.yaml) for all options.
+semantics, and [config.example.yaml](config.example.yaml) for all options
+(on OpenWrt the same options in UCI form:
+[packaging/openwrt/tunsel.config](packaging/openwrt/tunsel.config)).
 
 ## Host setup
 
@@ -44,19 +46,27 @@ config rule
 
 OpenWrt / Turris OS: each release has an `.ipk` per architecture (pick the
 last line of `opkg print-architecture`; `arm_cortex-a9_vfpv3-d16` on a Turris
-Omnia). It installs the binary, a procd service (enabled, but idle until a
-config exists) and the nftables/conntrack kernel modules it needs:
+Omnia) and `luci-app-tunsel_<version>_all.ipk`. The first installs the
+binary, a procd service, the UCI config `/etc/config/tunsel` (disabled, with
+placeholder tunnels) and the nftables/conntrack kernel modules it needs; the
+second adds Services → tunsel to LuCI, with a configuration page and a status
+page (health, latency history, connections and flows per tunnel):
 
 ```sh
-opkg update && opkg install ./tunsel_<version>_<arch>.ipk
-cp /etc/tunsel/config.example.yaml /etc/tunsel/config.yaml   # edit
-/etc/init.d/tunsel start
-tunsel status
-/etc/init.d/tunsel reload            # validate, then SIGHUP
+opkg update && opkg install ./tunsel_<version>_<arch>.ipk ./luci-app-tunsel_<version>_all.ipk
+```
+
+Configure in LuCI and Save & Apply, or from the shell:
+
+```sh
+uci set tunsel.main.enabled=1        # plus your tunnels; see /etc/config/tunsel
+uci commit tunsel
+/etc/init.d/tunsel reload            # validate, then SIGHUP (or start, stop if disabled)
+tunsel status                        # -flows: conntrack per tunnel; -history: RTT history
 logread -e tunsel
 ```
 
-The config is never replaced or removed by opkg and is kept by sysupgrade.
+opkg keeps a changed config on upgrade and removal, and sysupgrade keeps it.
 
 Container (host network; see DESIGN.md §9.1 for the runtime contract):
 
@@ -77,11 +87,14 @@ tunsel run -config /etc/tunsel/config.yaml
 tunsel status
 ```
 
+A config file whose name ends in `.yaml` or `.yml` is read as YAML, any other
+as UCI.
+
 ## Development
 
 ```sh
 task test                            # unit tests (nft tests skip without root)
 sudo task integration                # all tests incl. network-namespace end-to-end test
 task image                           # local image for the build host's platform
-packaging/openwrt/smoke-test.sh bin/tunsel_*_x86_64.ipk   # ipk on OpenWrt with procd (Docker)
+packaging/openwrt/smoke-test.sh bin/tunsel_*_x86_64.ipk bin/luci-app-tunsel_*_all.ipk   # on OpenWrt with procd and rpcd (Docker)
 ```

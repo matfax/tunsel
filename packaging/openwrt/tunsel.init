@@ -6,12 +6,20 @@ START=90
 STOP=10
 
 PROG=/usr/sbin/tunsel
-CONFIG=/etc/tunsel/config.yaml
+CONFIG=/etc/config/tunsel
+
+# The daemon ignores "enabled"; it only decides whether the service runs.
+uci_enabled() {
+	local enabled
+	config_load tunsel
+	config_get_bool enabled main enabled 0
+	[ "$enabled" = 1 ]
+}
 
 start_service() {
 	# Installed but not configured yet: nothing to run.
-	if [ ! -f "$CONFIG" ]; then
-		echo "tunsel: $CONFIG missing, not started (see /etc/tunsel/config.example.yaml)" >&2
+	if ! uci_enabled; then
+		echo "tunsel: disabled, not started (set tunsel.main.enabled=1 in $CONFIG or in LuCI)" >&2
 		return 0
 	fi
 	"$PROG" check -config "$CONFIG" >/dev/null || return 1
@@ -26,9 +34,22 @@ start_service() {
 	procd_close_instance
 }
 
+# `uci commit tunsel` (LuCI's Save & Apply) runs reload.
+service_triggers() {
+	procd_add_reload_trigger tunsel
+}
+
 reload_service() {
+	if ! uci_enabled; then
+		stop
+		return 0
+	fi
 	# The daemon keeps its configuration on an invalid reload; checking here
 	# also reports the error to the caller, not only to the log.
 	"$PROG" check -config "$CONFIG" >/dev/null || return 1
-	procd_send_signal tunsel
+	if procd_running tunsel; then
+		procd_send_signal tunsel
+	else
+		start
+	fi
 }

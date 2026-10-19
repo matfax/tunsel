@@ -66,6 +66,42 @@ func sample() *Ruleset {
 }
 
 const want = `table inet tunsel {
+	counter new {
+		packets 0 bytes 0
+	}
+
+	counter local {
+		packets 0 bytes 0
+	}
+
+	counter excluded {
+		packets 0 bytes 0
+	}
+
+	counter static_wg_a {
+		packets 0 bytes 0
+	}
+
+	counter default_wg_a {
+		packets 0 bytes 0
+	}
+
+	counter restore_wg_a {
+		packets 0 bytes 0
+	}
+
+	counter static_wg_b {
+		packets 0 bytes 0
+	}
+
+	counter default_wg_b {
+		packets 0 bytes 0
+	}
+
+	counter restore_wg_b {
+		packets 0 bytes 0
+	}
+
 	set ingress {
 		type ifname
 		elements = { "lan0",
@@ -87,13 +123,13 @@ const want = `table inet tunsel {
 	map static4 {
 		type ipv4_addr : verdict
 		flags interval
-		elements = { 203.0.113.0/25 : goto to_wg_a, 203.0.113.128/25 : goto to_wg_b }
+		elements = { 203.0.113.0/25 : goto static_wg_a, 203.0.113.128/25 : goto static_wg_b }
 	}
 
 	map static6 {
 		type ipv6_addr : verdict
 		flags interval
-		elements = { 2001:db8:100::/48 : goto to_wg_a }
+		elements = { 2001:db8:100::/48 : goto static_wg_a }
 	}
 
 	chain to_wg_a {
@@ -106,20 +142,28 @@ const want = `table inet tunsel {
 		ct mark set ct mark & 0xfffffff2 | 0x00000002
 	}
 
+	chain static_wg_a {
+		counter name "static_wg_a" goto to_wg_a
+	}
+
+	chain static_wg_b {
+		counter name "static_wg_b" goto to_wg_b
+	}
+
 	chain pick4 {
-		goto to_wg_b
+		counter name "default_wg_b" goto to_wg_b
 	}
 
 	chain pick6 {
-		goto to_wg_a
+		counter name "default_wg_a" goto to_wg_a
 	}
 
 	chain decide {
-		fib daddr type local return
-		fib daddr type broadcast return
-		fib daddr type multicast return
-		ip daddr @exclude4 return
-		ip6 daddr @exclude6 return
+		fib daddr type local counter name "local" return
+		fib daddr type broadcast counter name "local" return
+		fib daddr type multicast counter name "local" return
+		ip daddr @exclude4 counter name "excluded" return
+		ip6 daddr @exclude6 counter name "excluded" return
 		ip daddr vmap @static4
 		ip6 daddr vmap @static6
 		meta nfproto ipv4 goto pick4
@@ -127,9 +171,9 @@ const want = `table inet tunsel {
 	}
 
 	chain steer {
-		ct state new goto decide
-		ct mark & 0x0000000f == 0x00000001 goto to_wg_a
-		ct mark & 0x0000000f == 0x00000002 goto to_wg_b
+		ct state new counter name "new" goto decide
+		ct mark & 0x0000000f == 0x00000001 counter name "restore_wg_a" goto to_wg_a
+		ct mark & 0x0000000f == 0x00000002 counter name "restore_wg_b" goto to_wg_b
 	}
 
 	chain prerouting {
@@ -170,6 +214,43 @@ func TestApply(t *testing.T) {
 		if strings.Contains(got, gone) {
 			t.Errorf("still contains %q:\n%s", gone, got)
 		}
+	}
+}
+
+// Counters survive the table replacement of every apply.
+func TestCountersKept(t *testing.T) {
+	m, run := netns(t)
+	if c, err := m.Counters("tunsel"); err != nil || c != nil {
+		t.Fatalf("no table: %v %v", c, err)
+	}
+	rs := sample()
+	rs.LocalOutput = true
+	if err := m.Apply(rs); err != nil {
+		t.Fatal(err)
+	}
+	run("ip", "link", "set", "lo", "up")
+	run("ping", "-c", "2", "-i", "0.2", "127.0.0.1") // one new connection, local
+	before, err := m.Counters("tunsel")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before[CounterNew].Packets != 1 || before[CounterLocal].Packets != 1 {
+		t.Fatalf("after ping: %+v", before)
+	}
+
+	rs.Default4 = "wg-a"
+	if err := m.Apply(rs); err != nil {
+		t.Fatal(err)
+	}
+	after, err := m.Counters("tunsel")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after[CounterNew] != before[CounterNew] || after[CounterLocal] != before[CounterLocal] {
+		t.Errorf("counters lost on apply: before %+v, after %+v", before, after)
+	}
+	if _, ok := after[RestoreCounter("wg-b")]; !ok {
+		t.Errorf("per-tunnel counters missing: %+v", after)
 	}
 }
 

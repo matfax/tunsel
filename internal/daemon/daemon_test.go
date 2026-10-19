@@ -12,8 +12,10 @@ import (
 	"time"
 
 	"github.com/matfax/tunsel/internal/config"
+	"github.com/matfax/tunsel/internal/flows"
 	"github.com/matfax/tunsel/internal/health"
 	"github.com/matfax/tunsel/internal/nft"
+	"github.com/matfax/tunsel/internal/status"
 )
 
 type fakeTables struct {
@@ -21,6 +23,7 @@ type fakeTables struct {
 	applied   []*nft.Ruleset
 	failTable string
 	v4, v6    string // installed defaults (chain names)
+	counters  map[string]nft.Counter
 }
 
 func (f *fakeTables) Apply(rs *nft.Ruleset, _ ...string) error {
@@ -37,6 +40,11 @@ func (f *fakeTables) Delete(string) error         { return nil }
 func (f *fakeTables) Defaults(string) (string, string, error) {
 	return f.v4, f.v6, nil
 }
+func (f *fakeTables) Counters(string) (map[string]nft.Counter, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.counters, nil
+}
 func (f *fakeTables) last() *nft.Ruleset {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -49,15 +57,15 @@ type fakeProbes struct {
 	down map[netip.Addr]bool
 }
 
-func (f *fakeProbes) Probe(ctx context.Context, p health.Probe) error {
+func (f *fakeProbes) Probe(ctx context.Context, p health.Probe) (time.Duration, error) {
 	f.mu.Lock()
 	down := f.down[p.Target]
 	f.mu.Unlock()
 	if down {
 		<-ctx.Done()
-		return ctx.Err()
+		return 0, ctx.Err()
 	}
-	return nil
+	return time.Millisecond, nil
 }
 
 func (f *fakeProbes) set(addr string, down bool) {
@@ -204,5 +212,54 @@ func TestRestartKeepsInstalledDefaults(t *testing.T) {
 	}
 	if f := h.flushes(); len(f) != 2 {
 		t.Errorf("flushes on start with both down: %v", f)
+	}
+}
+
+// The report combines health, latency, nft counters and conntrack flows.
+func TestReport(t *testing.T) {
+	h := newHarness(t)
+	h.tables.counters = map[string]nft.Counter{
+		nft.CounterNew: {Packets: 10}, nft.CounterLocal: {Packets: 1}, nft.CounterExcluded: {Packets: 2},
+		nft.DefaultCounter("wg-b"): {Packets: 4}, nft.StaticCounter("wg-a"): {Packets: 2},
+		nft.RestoreCounter("wg-b"): {Packets: 30, Bytes: 4000},
+	}
+	dumps := 0
+	h.d.flows.Dump = func() ([]flows.Entry, error) {
+		dumps++
+		return []flows.Entry{{Mark: 0x2, Dst: netip.MustParseAddr("203.0.113.9")}, {Mark: 0}}, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := h.d.activate(ctx, h.d.cfg, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	r := h.d.report(status.Request{})
+	if r.Connections != (status.Connections{New: 10, Local: 1, Excluded: 2, Unmarked: 1}) {
+		t.Errorf("connections: %+v", r.Connections)
+	}
+	a, b := r.Tunnels[0], r.Tunnels[1]
+	if a.Static != 2 || b.Default != 4 || b.Upstream.Bytes != 4000 {
+		t.Errorf("tunnel counters: %+v / %+v", a, b)
+	}
+	if len(a.Latency) != 1 || a.Latency[0].Last.D() != time.Millisecond || a.History != nil {
+		t.Errorf("latency: %+v, history %v", a.Latency, a.History)
+	}
+	if r.Flows != nil || dumps != 0 {
+		t.Error("flows dumped without being requested")
+	}
+
+	r = h.d.report(status.Request{Flows: true, History: true})
+	if r.Flows == nil || r.Flows.Tunnels["wg-b"].Flows != 1 || r.Flows.Other != 1 {
+		t.Errorf("flows: %+v", r.Flows)
+	}
+	if len(r.Tunnels[0].History) != 1 || len(r.Tunnels[0].History[0].Samples) == 0 {
+		t.Errorf("history: %+v", r.Tunnels[0].History)
+	}
+
+	h.d.flows.Dump = func() ([]flows.Entry, error) { return nil, errors.New("no ctnetlink") }
+	h.d.flows.MaxAge = 0
+	if r := h.d.report(status.Request{Flows: true}); r.Flows != nil || len(r.Warnings) != 1 {
+		t.Errorf("dump error: flows %+v, warnings %v", r.Flows, r.Warnings)
 	}
 }

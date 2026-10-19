@@ -1,7 +1,8 @@
 #!/bin/sh
 # Builds OpenWrt / Turris OS packages (.ipk) of tunsel, one per opkg
-# architecture, in the layout of the SDK's ipkg-build: an outer tar.gz with
-# debian-binary, control.tar.gz and data.tar.gz. Needs Go and GNU tar.
+# architecture, plus the architecture-independent luci-app-tunsel, in the
+# layout of the SDK's ipkg-build: an outer tar.gz with debian-binary,
+# control.tar.gz and data.tar.gz. Needs Go and GNU tar.
 #
 # usage: build-ipk.sh <version> <outdir> <opkg-arch>...
 # The opkg architecture of a device is the last line of
@@ -36,6 +37,15 @@ mktar() { # <dir> <archive.tar.gz> <entry>...
 		--mtime="@$epoch" -cf - "$@") | gzip -9n >"$out"
 }
 
+# Packs <pkg>/data and <pkg>/control into <outdir>/<name>_<pkgver>_<arch>.ipk.
+mkipk() { # <pkg> <name> <arch>
+	echo 2.0 >"$1/debian-binary"
+	mktar "$1/data" "$1/data.tar.gz" .
+	mktar "$1/control" "$1/control.tar.gz" .
+	mktar "$1" "$outdir/$2_${pkgver}_$3.ipk" ./debian-binary ./data.tar.gz ./control.tar.gz
+	echo "$outdir/$2_${pkgver}_$3.ipk"
+}
+
 for arch in "$@"; do
 	# The binary is static, so one build per Go target serves every opkg
 	# architecture of that CPU family.
@@ -49,16 +59,15 @@ for arch in "$@"; do
 	pkg=$work/$arch
 	data=$pkg/data
 	ctrl=$pkg/control
-	mkdir -p "$data/usr/sbin" "$data/etc/init.d" "$data/etc/tunsel" "$data/lib/upgrade/keep.d" "$ctrl"
+	mkdir -p "$data/usr/sbin" "$data/etc/init.d" "$data/etc/config" "$ctrl"
 
 	(cd "$root" && CGO_ENABLED=0 GOOS=linux GOARCH=$goarch GOARM=$goarm \
 		go build -trimpath -ldflags "$ldflags" -o "$data/usr/sbin/tunsel" ./cmd/tunsel)
 	install -m 0755 "$here/tunsel.init" "$data/etc/init.d/tunsel"
-	install -m 0644 "$root/config.example.yaml" "$data/etc/tunsel/config.example.yaml"
-	# The config is the user's, not the package's: opkg never replaces or
-	# removes it, and sysupgrade keeps it.
-	echo /etc/tunsel/config.yaml >"$data/lib/upgrade/keep.d/tunsel"
-	chmod 0644 "$data/lib/upgrade/keep.d/tunsel"
+	# Shipped disabled. As a conffile, opkg keeps the user's changes on
+	# upgrade and sysupgrade keeps them across firmware upgrades.
+	install -m 0644 "$here/tunsel.config" "$data/etc/config/tunsel"
+	echo /etc/config/tunsel >"$ctrl/conffiles"
 
 	size=$(du -sb --apparent-size "$data" | cut -f1)
 	cat >"$ctrl/control" <<-EOF
@@ -75,11 +84,35 @@ for arch in "$@"; do
 	EOF
 	install -m 0755 "$here/postinst" "$ctrl/postinst"
 	install -m 0755 "$here/prerm" "$ctrl/prerm"
-	chmod 0644 "$ctrl/control"
+	chmod 0644 "$ctrl/control" "$ctrl/conffiles"
 
-	echo 2.0 >"$pkg/debian-binary"
-	mktar "$data" "$pkg/data.tar.gz" .
-	mktar "$ctrl" "$pkg/control.tar.gz" .
-	mktar "$pkg" "$outdir/tunsel_${pkgver}_$arch.ipk" ./debian-binary ./data.tar.gz ./control.tar.gz
-	echo "$outdir/tunsel_${pkgver}_$arch.ipk"
+	mkipk "$pkg" tunsel "$arch"
 done
+
+# LuCI pages: configuration (UCI) and status (via the rpcd plugin).
+luci=$here/luci
+pkg=$work/luci
+data=$pkg/data
+ctrl=$pkg/control
+mkdir -p "$data/www/luci-static/resources/view/tunsel" "$data/usr/share/luci/menu.d" \
+	"$data/usr/share/rpcd/acl.d" "$data/usr/libexec/rpcd" "$ctrl"
+install -m 0644 "$luci/view/config.js" "$luci/view/status.js" "$data/www/luci-static/resources/view/tunsel/"
+install -m 0644 "$luci/menu.json" "$data/usr/share/luci/menu.d/luci-app-tunsel.json"
+install -m 0644 "$luci/acl.json" "$data/usr/share/rpcd/acl.d/luci-app-tunsel.json"
+install -m 0755 "$luci/rpcd/tunsel" "$data/usr/libexec/rpcd/tunsel"
+size=$(du -sb --apparent-size "$data" | cut -f1)
+cat >"$ctrl/control" <<-EOF
+Package: luci-app-tunsel
+Version: $pkgver
+Depends: tunsel, luci-base
+Source: https://github.com/matfax/tunsel
+Section: luci
+SourceDateEpoch: $epoch
+URL: https://github.com/matfax/tunsel
+Architecture: all
+Installed-Size: $size
+Description:  LuCI pages for tunsel: configuration and status
+EOF
+install -m 0755 "$luci/postinst" "$ctrl/postinst"
+chmod 0644 "$ctrl/control"
+mkipk "$pkg" luci-app-tunsel all
