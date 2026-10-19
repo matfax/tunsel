@@ -44,7 +44,7 @@ type Apply struct {
 // Serve accepts connections on a unix socket at path and writes the
 // current report to each, until ctx is done.
 func Serve(ctx context.Context, path string, report func() Report) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return err
 	}
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -54,7 +54,7 @@ func Serve(ctx context.Context, path string, report func() Report) error {
 	if err != nil {
 		return err
 	}
-	if err := os.Chmod(path, 0o660); err != nil {
+	if err := os.Chmod(path, 0o600); err != nil {
 		l.Close()
 		return err
 	}

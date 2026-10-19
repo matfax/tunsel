@@ -274,19 +274,34 @@ var ifnameRE = regexp.MustCompile(`^[^/\s:]{1,15}$`)
 
 var tableRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`)
 
+// errList collects validation failures so all of them are reported at once.
+type errList []error
+
+func (e *errList) fail(format string, a ...any) { *e = append(*e, fmt.Errorf(format, a...)) }
+
 func (c *Config) validate() error {
-	var errs []error
-	fail := func(format string, a ...any) { errs = append(errs, fmt.Errorf(format, a...)) }
+	var errs errList
 
 	if !tableRE.MatchString(c.NFT.Table) {
-		fail("nft.table %q: must match %s", c.NFT.Table, tableRE)
+		errs.fail("nft.table %q: must match %s", c.NFT.Table, tableRE)
 	}
 	if c.NFT.MarkMask == 0 {
-		fail("nft.mark_mask: must be non-zero")
+		errs.fail("nft.mark_mask: must be non-zero")
 	}
 
+	byName := c.validateTunnels(&errs)
+	c.validateDefaultOrder(&errs, byName)
+	c.validateIngress(&errs, byName)
+	c.validateStaticPref(&errs, byName)
+	c.validateMisc(&errs)
+
+	return errors.Join(errs...)
+}
+
+// validateTunnels checks every tunnel and returns them by name.
+func (c *Config) validateTunnels(errs *errList) map[string]*Tunnel {
 	if len(c.Tunnels) == 0 {
-		fail("tunnels: at least one tunnel is required")
+		errs.fail("tunnels: at least one tunnel is required")
 	}
 	byName := map[string]*Tunnel{}
 	marks := map[uint32]string{}
@@ -295,138 +310,160 @@ func (c *Config) validate() error {
 		t := &c.Tunnels[i]
 		where := fmt.Sprintf("tunnels[%d] (%s)", i, t.Name)
 		if !ifnameRE.MatchString(t.Name) {
-			fail("%s: name must be a valid interface name (1-15 chars, no '/', ':' or whitespace)", where)
+			errs.fail("%s: name must be a valid interface name (1-15 chars, no '/', ':' or whitespace)", where)
 		} else if _, dup := byName[t.Name]; dup {
-			fail("%s: duplicate tunnel name", where)
+			errs.fail("%s: duplicate tunnel name", where)
 		} else if other, dup := chains[nft.ChainName(t.Name)]; dup {
-			fail("%s: name maps to the same nft chain (%s) as %s; rename one", where, nft.ChainName(t.Name), other)
+			errs.fail("%s: name maps to the same nft chain (%s) as %s; rename one", where, nft.ChainName(t.Name), other)
 		}
 		chains[nft.ChainName(t.Name)] = t.Name
 		byName[t.Name] = t
 
-		switch {
-		case t.Mark == 0:
-			fail("%s: mark must be non-zero", where)
-		case t.Mark&^c.NFT.MarkMask != 0:
-			fail("%s: mark %#x has bits outside mark_mask %#x", where, t.Mark, c.NFT.MarkMask)
-		default:
-			if other, dup := marks[t.Mark]; dup {
-				fail("%s: mark %#x already used by %s", where, t.Mark, other)
-			}
-			marks[t.Mark] = t.Name
-		}
+		c.validateMark(errs, where, t, marks)
+		validateFamilies(errs, where, t)
+		validateHealth(errs, where, t)
+	}
+	return byName
+}
 
-		for _, f := range t.Families {
-			switch f {
-			case "ipv4":
-				t.IPv4 = true
-			case "ipv6":
-				t.IPv6 = true
-			default:
-				fail("%s: unknown family %q (ipv4 | ipv6)", where, f)
-			}
+func (c *Config) validateMark(errs *errList, where string, t *Tunnel, marks map[uint32]string) {
+	switch {
+	case t.Mark == 0:
+		errs.fail("%s: mark must be non-zero", where)
+	case t.Mark&^c.NFT.MarkMask != 0:
+		errs.fail("%s: mark %#x has bits outside mark_mask %#x", where, t.Mark, c.NFT.MarkMask)
+	default:
+		if other, dup := marks[t.Mark]; dup {
+			errs.fail("%s: mark %#x already used by %s", where, t.Mark, other)
 		}
+		marks[t.Mark] = t.Name
+	}
+}
 
-		h := &t.Health
-		if len(h.Targets) == 0 {
-			fail("%s: health.targets: at least one target is required", where)
-		}
-		for j, a := range h.Targets {
-			a = a.Unmap()
-			h.Targets[j] = a
-			if a.Zone() != "" || !a.IsValid() {
-				fail("%s: health.targets: invalid address %s", where, a)
-			} else if !t.Carries(a) {
-				fail("%s: health target %s: tunnel does not carry its family", where, a)
-			}
-		}
-		switch {
-		case h.Probe == "icmp":
-			h.ProbeKind = ProbeICMP
-		case strings.HasPrefix(h.Probe, "tcp:"):
-			port, err := strconv.ParseUint(strings.TrimPrefix(h.Probe, "tcp:"), 10, 16)
-			if err != nil || port == 0 {
-				fail("%s: health.probe %q: invalid port", where, h.Probe)
-			}
-			h.ProbeKind, h.ProbePort = ProbeTCP, uint16(port)
+func validateFamilies(errs *errList, where string, t *Tunnel) {
+	for _, f := range t.Families {
+		switch f {
+		case "ipv4":
+			t.IPv4 = true
+		case "ipv6":
+			t.IPv6 = true
 		default:
-			fail("%s: health.probe %q: expected icmp or tcp:<port>", where, h.Probe)
-		}
-		if h.Interval.D() <= 0 || h.Timeout.D() <= 0 {
-			fail("%s: health.interval and health.timeout must be positive", where)
-		} else if h.Timeout >= h.Interval {
-			fail("%s: health.timeout (%s) must be shorter than health.interval (%s)", where, h.Timeout.D(), h.Interval.D())
-		}
-		if h.MinOK < 1 || h.MinOK > len(h.Targets) {
-			fail("%s: health.min_ok must be between 1 and the number of targets (%d)", where, len(h.Targets))
-		}
-		if h.FailAfter < 1 || h.RecoverAfter < 1 {
-			fail("%s: health.fail_after and health.recover_after must be at least 1", where)
+			errs.fail("%s: unknown family %q (ipv4 | ipv6)", where, f)
 		}
 	}
+}
 
+func validateHealth(errs *errList, where string, t *Tunnel) {
+	h := &t.Health
+	if len(h.Targets) == 0 {
+		errs.fail("%s: health.targets: at least one target is required", where)
+	}
+	for j, a := range h.Targets {
+		a = a.Unmap()
+		h.Targets[j] = a
+		if a.Zone() != "" || !a.IsValid() {
+			errs.fail("%s: health.targets: invalid address %s", where, a)
+		} else if !t.Carries(a) {
+			errs.fail("%s: health target %s: tunnel does not carry its family", where, a)
+		}
+	}
+	parseProbe(errs, where, h)
+	if h.Interval.D() <= 0 || h.Timeout.D() <= 0 {
+		errs.fail("%s: health.interval and health.timeout must be positive", where)
+	} else if h.Timeout >= h.Interval {
+		errs.fail("%s: health.timeout (%s) must be shorter than health.interval (%s)", where, h.Timeout.D(), h.Interval.D())
+	}
+	if h.MinOK < 1 || h.MinOK > len(h.Targets) {
+		errs.fail("%s: health.min_ok must be between 1 and the number of targets (%d)", where, len(h.Targets))
+	}
+	if h.FailAfter < 1 || h.RecoverAfter < 1 {
+		errs.fail("%s: health.fail_after and health.recover_after must be at least 1", where)
+	}
+}
+
+func parseProbe(errs *errList, where string, h *Health) {
+	switch {
+	case h.Probe == "icmp":
+		h.ProbeKind = ProbeICMP
+	case strings.HasPrefix(h.Probe, "tcp:"):
+		port, err := strconv.ParseUint(strings.TrimPrefix(h.Probe, "tcp:"), 10, 16)
+		if err != nil || port == 0 {
+			errs.fail("%s: health.probe %q: invalid port", where, h.Probe)
+		}
+		h.ProbeKind, h.ProbePort = ProbeTCP, uint16(port)
+	default:
+		errs.fail("%s: health.probe %q: expected icmp or tcp:<port>", where, h.Probe)
+	}
+}
+
+func (c *Config) validateDefaultOrder(errs *errList, byName map[string]*Tunnel) {
 	if len(c.DefaultOrder) == 0 {
-		fail("default_order: at least one tunnel is required")
+		errs.fail("default_order: at least one tunnel is required")
 	}
 	seen := map[string]bool{}
 	for _, n := range c.DefaultOrder {
 		if byName[n] == nil {
-			fail("default_order: unknown tunnel %q", n)
+			errs.fail("default_order: unknown tunnel %q", n)
 		} else if seen[n] {
-			fail("default_order: tunnel %q listed twice", n)
+			errs.fail("default_order: tunnel %q listed twice", n)
 		}
 		seen[n] = true
 	}
+}
 
+func (c *Config) validateIngress(errs *errList, byName map[string]*Tunnel) {
 	if len(c.Ingress.Interfaces) == 0 && !c.Ingress.IncludeLocalOutput {
-		fail("ingress: no interfaces and include_local_output is false; nothing would be steered")
+		errs.fail("ingress: no interfaces and include_local_output is false; nothing would be steered")
 	}
 	for _, n := range c.Ingress.Interfaces {
 		if !ifnameRE.MatchString(n) {
-			fail("ingress.interfaces: invalid interface name %q", n)
+			errs.fail("ingress.interfaces: invalid interface name %q", n)
 		} else if byName[n] != nil {
-			fail("ingress.interfaces: %q is a tunnel", n)
+			errs.fail("ingress.interfaces: %q is a tunnel", n)
 		}
 	}
+}
 
+func (c *Config) validateStaticPref(errs *errList, byName map[string]*Tunnel) {
 	staticSeen := map[netip.Prefix]bool{}
 	for i, s := range c.StaticPref {
 		t := byName[s.Tunnel]
 		switch {
 		case !s.Prefix.IsValid():
-			fail("static_pref[%d]: prefix is required", i)
+			errs.fail("static_pref[%d]: prefix is required", i)
 		case t == nil:
-			fail("static_pref[%d] (%s): unknown tunnel %q", i, s.Prefix, s.Tunnel)
+			errs.fail("static_pref[%d] (%s): unknown tunnel %q", i, s.Prefix, s.Tunnel)
 		case !t.Carries(s.Prefix.Addr()):
-			fail("static_pref[%d] (%s): tunnel %s does not carry this family", i, s.Prefix, s.Tunnel)
+			errs.fail("static_pref[%d] (%s): tunnel %s does not carry this family", i, s.Prefix, s.Tunnel)
 		case staticSeen[s.Prefix.Prefix]:
-			fail("static_pref[%d]: prefix %s listed twice", i, s.Prefix)
+			errs.fail("static_pref[%d]: prefix %s listed twice", i, s.Prefix)
 		}
 		staticSeen[s.Prefix.Prefix] = true
 	}
+}
 
+// validateMisc checks the unimplemented features, logging and the status socket.
+func (c *Config) validateMisc(errs *errList) {
 	if c.Learning.Enabled {
-		fail("learning.enabled: per-destination learning (phase 2) is not implemented in this version")
+		errs.fail("learning.enabled: per-destination learning (phase 2) is not implemented in this version")
 	}
 	if c.Metrics.Listen != "" {
-		fail("metrics.listen: the metrics endpoint is not implemented in this version; leave it empty")
+		errs.fail("metrics.listen: the metrics endpoint is not implemented in this version; leave it empty")
 	}
 
 	switch c.Log.Level {
 	case "debug", "info", "warn", "error":
 	default:
-		fail("log.level %q: expected debug | info | warn | error", c.Log.Level)
+		errs.fail("log.level %q: expected debug | info | warn | error", c.Log.Level)
 	}
 	switch c.Log.Format {
 	case "text", "json":
 	default:
-		fail("log.format %q: expected text | json", c.Log.Format)
+		errs.fail("log.format %q: expected text | json", c.Log.Format)
 	}
 	if !filepath.IsAbs(c.Status.Socket) {
-		fail("status.socket %q: must be an absolute path", c.Status.Socket)
+		errs.fail("status.socket %q: must be an absolute path", c.Status.Socket)
 	}
-
-	return errors.Join(errs...)
 }
 
 // Tunnel returns the tunnel with the given name, or nil.

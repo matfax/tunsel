@@ -164,14 +164,14 @@ Health filtering is applied when materializing 2–4, so a dead tunnel is never 
 
 A working Docker engine on the host is assumed; the tool ships only the image and a compose file.
 
-**Image**
+#### Image
 
 - Multi-arch manifest: `linux/arm/v7` (`GOARM=7`), `linux/arm64`, `linux/amd64`.
 - Base `scratch`: the static binary only, as entrypoint. No shell, no `nft` binary — nftables and conntrack are driven via netlink.
 - Fixed paths: config `/etc/tunsel/config.yaml`, runtime directory `/run/tunsel/` (status socket `/run/tunsel/tunsel.sock`).
 - Name and registry are a CI parameter (`<registry>/tunsel`). Tags: `X.Y.Z`, `X.Y`, `latest`.
 
-**Runtime contract**
+#### Runtime contract
 
 | Aspect | Requirement |
 |---|---|

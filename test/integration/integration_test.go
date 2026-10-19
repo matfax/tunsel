@@ -235,7 +235,7 @@ func start(t *testing.T, bin string) *daemon {
 }
 
 func (d *daemon) write(t *testing.T, order string) {
-	if err := os.WriteFile(d.cfg, []byte(fmt.Sprintf(configTmpl, order, d.socket)), 0o644); err != nil {
+	if err := os.WriteFile(d.cfg, []byte(fmt.Sprintf(configTmpl, order, d.socket)), 0o600); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -360,7 +360,7 @@ func TestEndToEnd(t *testing.T) {
 	})
 
 	t.Run("reload", func(t *testing.T) {
-		os.WriteFile(d.cfg, []byte("not: [valid"), 0o644)
+		os.WriteFile(d.cfg, []byte("not: [valid"), 0o600)
 		d.cmd.Process.Signal(syscall.SIGHUP)
 		eventually(t, "invalid reload logged", func() bool { return strings.Contains(d.log.String(), "reload failed") })
 		if got := via(t, nsLAN, ping(dstDefault)); got != "wg-b" {

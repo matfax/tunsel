@@ -208,121 +208,160 @@ func (rs *Ruleset) check() error {
 }
 
 func build(c *nftables.Conn, rs *Ruleset) error {
-	t := c.AddTable(&nftables.Table{Family: nftables.TableFamilyINet, Name: rs.Table})
-
-	chain := func(name string) *nftables.Chain {
-		return c.AddChain(&nftables.Chain{Table: t, Name: name})
-	}
-	rule := func(ch *nftables.Chain, es ...expr.Any) {
-		c.AddRule(&nftables.Rule{Table: t, Chain: ch, Exprs: es})
-	}
-
+	b := &builder{c: c, rs: rs, t: c.AddTable(&nftables.Table{Family: nftables.TableFamilyINet, Name: rs.Table})}
 	// Tunnel chains come first: map elements and rules jump to them.
-	notMask := ne32(^rs.Mask)
-	for _, tun := range rs.Tunnels {
-		ch := chain(ChainName(tun.Name))
-		rule(ch,
+	b.tunnelChains()
+	s, err := b.addSets()
+	if err != nil {
+		return err
+	}
+	steer := b.steerChain(b.decideChain(s))
+	b.hookChains(s.ingress, steer)
+	return nil
+}
+
+// builder adds the objects of one ruleset to a batch, in dependency order.
+type builder struct {
+	c  *nftables.Conn
+	t  *nftables.Table
+	rs *Ruleset
+}
+
+type sets struct {
+	ingress, exclude4, exclude6, static4, static6 *nftables.Set
+}
+
+func (b *builder) chain(name string) *nftables.Chain {
+	return b.c.AddChain(&nftables.Chain{Table: b.t, Name: name})
+}
+
+func (b *builder) rule(ch *nftables.Chain, es ...expr.Any) {
+	b.c.AddRule(&nftables.Rule{Table: b.t, Chain: ch, Exprs: es})
+}
+
+func (b *builder) tunnelChains() {
+	notMask := ne32(^b.rs.Mask)
+	for _, tun := range b.rs.Tunnels {
+		ch := b.chain(ChainName(tun.Name))
+		b.rule(ch,
 			&expr.Meta{Key: expr.MetaKeyMARK, Register: 1},
 			&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4, Mask: notMask, Xor: ne32(tun.Mark)},
 			&expr.Meta{Key: expr.MetaKeyMARK, SourceRegister: true, Register: 1})
-		rule(ch,
+		b.rule(ch,
 			&expr.Ct{Key: expr.CtKeyMARK, Register: 1},
 			&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4, Mask: notMask, Xor: ne32(tun.Mark)},
 			&expr.Ct{Key: expr.CtKeyMARK, SourceRegister: true, Register: 1})
 	}
+}
 
-	ingress := &nftables.Set{Table: t, Name: "ingress", KeyType: nftables.TypeIFName, KeyByteOrder: binaryutil.NativeEndian}
+func (b *builder) addSets() (sets, error) {
+	t, rs := b.t, b.rs
+	s := sets{
+		ingress:  &nftables.Set{Table: t, Name: "ingress", KeyType: nftables.TypeIFName, KeyByteOrder: binaryutil.NativeEndian},
+		exclude4: &nftables.Set{Table: t, Name: "exclude4", KeyType: nftables.TypeIPAddr, Interval: true},
+		exclude6: &nftables.Set{Table: t, Name: "exclude6", KeyType: nftables.TypeIP6Addr, Interval: true},
+		static4:  &nftables.Set{Table: t, Name: "static4", KeyType: nftables.TypeIPAddr, DataType: nftables.TypeVerdict, IsMap: true, Interval: true},
+		static6:  &nftables.Set{Table: t, Name: "static6", KeyType: nftables.TypeIP6Addr, DataType: nftables.TypeVerdict, IsMap: true, Interval: true},
+	}
 	var ifs []nftables.SetElement
 	for _, n := range rs.Ingress {
 		ifs = append(ifs, nftables.SetElement{Key: ifname(n)})
 	}
-	exclude4 := &nftables.Set{Table: t, Name: "exclude4", KeyType: nftables.TypeIPAddr, Interval: true}
-	exclude6 := &nftables.Set{Table: t, Name: "exclude6", KeyType: nftables.TypeIP6Addr, Interval: true}
-	static4 := &nftables.Set{Table: t, Name: "static4", KeyType: nftables.TypeIPAddr, DataType: nftables.TypeVerdict, IsMap: true, Interval: true}
-	static6 := &nftables.Set{Table: t, Name: "static6", KeyType: nftables.TypeIP6Addr, DataType: nftables.TypeVerdict, IsMap: true, Interval: true}
-	for _, s := range []struct {
+	for _, e := range []struct {
 		set   *nftables.Set
 		elems []nftables.SetElement
 	}{
-		{ingress, ifs},
-		{exclude4, intervals(rs.Exclude4, nil)},
-		{exclude6, intervals(rs.Exclude6, nil)},
-		{static4, intervals(rs.Static4, gotoTunnel)},
-		{static6, intervals(rs.Static6, gotoTunnel)},
+		{s.ingress, ifs},
+		{s.exclude4, intervals(rs.Exclude4, nil)},
+		{s.exclude6, intervals(rs.Exclude6, nil)},
+		{s.static4, intervals(rs.Static4, gotoTunnel)},
+		{s.static6, intervals(rs.Static6, gotoTunnel)},
 	} {
-		if err := addSet(c, s.set, s.elems); err != nil {
-			return fmt.Errorf("set %s: %w", s.set.Name, err)
+		if err := addSet(b.c, e.set, e.elems); err != nil {
+			return sets{}, fmt.Errorf("set %s: %w", e.set.Name, err)
 		}
 	}
+	return s, nil
+}
 
-	pick4, pick6 := chain("pick4"), chain("pick6")
-	if rs.Default4 != "" {
-		rule(pick4, gotoTunnel(rs.Default4))
+// decideChain adds the chain that picks a tunnel for a new connection.
+func (b *builder) decideChain(s sets) *nftables.Chain {
+	pick4, pick6 := b.chain("pick4"), b.chain("pick6")
+	if b.rs.Default4 != "" {
+		b.rule(pick4, gotoTunnel(b.rs.Default4))
 	}
-	if rs.Default6 != "" {
-		rule(pick6, gotoTunnel(rs.Default6))
+	if b.rs.Default6 != "" {
+		b.rule(pick6, gotoTunnel(b.rs.Default6))
 	}
 
-	decide := chain("decide")
+	decide := b.chain("decide")
 	for _, typ := range []uint32{unix.RTN_LOCAL, unix.RTN_BROADCAST, unix.RTN_MULTICAST} {
-		rule(decide,
+		b.rule(decide,
 			&expr.Fib{Register: 1, FlagDADDR: true, ResultADDRTYPE: true},
 			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ne32(typ)},
 			&expr.Verdict{Kind: expr.VerdictReturn})
 	}
-	rule(decide, append(daddr(unix.NFPROTO_IPV4),
-		&expr.Lookup{SourceRegister: 1, SetName: exclude4.Name, SetID: exclude4.ID},
+	b.rule(decide, append(daddr(unix.NFPROTO_IPV4),
+		&expr.Lookup{SourceRegister: 1, SetName: s.exclude4.Name, SetID: s.exclude4.ID},
 		&expr.Verdict{Kind: expr.VerdictReturn})...)
-	rule(decide, append(daddr(unix.NFPROTO_IPV6),
-		&expr.Lookup{SourceRegister: 1, SetName: exclude6.Name, SetID: exclude6.ID},
+	b.rule(decide, append(daddr(unix.NFPROTO_IPV6),
+		&expr.Lookup{SourceRegister: 1, SetName: s.exclude6.Name, SetID: s.exclude6.ID},
 		&expr.Verdict{Kind: expr.VerdictReturn})...)
-	rule(decide, append(daddr(unix.NFPROTO_IPV4),
-		&expr.Lookup{SourceRegister: 1, DestRegister: 0, IsDestRegSet: true, SetName: static4.Name, SetID: static4.ID})...)
-	rule(decide, append(daddr(unix.NFPROTO_IPV6),
-		&expr.Lookup{SourceRegister: 1, DestRegister: 0, IsDestRegSet: true, SetName: static6.Name, SetID: static6.ID})...)
-	rule(decide, append(nfproto(unix.NFPROTO_IPV4), &expr.Verdict{Kind: expr.VerdictGoto, Chain: pick4.Name})...)
-	rule(decide, append(nfproto(unix.NFPROTO_IPV6), &expr.Verdict{Kind: expr.VerdictGoto, Chain: pick6.Name})...)
+	b.rule(decide, append(daddr(unix.NFPROTO_IPV4),
+		&expr.Lookup{SourceRegister: 1, DestRegister: 0, IsDestRegSet: true, SetName: s.static4.Name, SetID: s.static4.ID})...)
+	b.rule(decide, append(daddr(unix.NFPROTO_IPV6),
+		&expr.Lookup{SourceRegister: 1, DestRegister: 0, IsDestRegSet: true, SetName: s.static6.Name, SetID: s.static6.ID})...)
+	b.rule(decide, append(nfproto(unix.NFPROTO_IPV4), &expr.Verdict{Kind: expr.VerdictGoto, Chain: pick4.Name})...)
+	b.rule(decide, append(nfproto(unix.NFPROTO_IPV6), &expr.Verdict{Kind: expr.VerdictGoto, Chain: pick6.Name})...)
+	return decide
+}
 
-	steer := chain("steer")
-	rule(steer,
+// steerChain adds the chain that sends new connections to decide and
+// existing ones back to the tunnel their conntrack mark names.
+func (b *builder) steerChain(decide *nftables.Chain) *nftables.Chain {
+	steer := b.chain("steer")
+	b.rule(steer,
 		&expr.Ct{Key: expr.CtKeySTATE, Register: 1},
 		&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4, Mask: ne32(expr.CtStateBitNEW), Xor: ne32(0)},
 		&expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: ne32(0)},
 		&expr.Verdict{Kind: expr.VerdictGoto, Chain: decide.Name})
-	for _, tun := range rs.Tunnels {
-		rule(steer,
+	for _, tun := range b.rs.Tunnels {
+		b.rule(steer,
 			&expr.Ct{Key: expr.CtKeyMARK, Register: 1},
-			&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4, Mask: ne32(rs.Mask), Xor: ne32(0)},
+			&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4, Mask: ne32(b.rs.Mask), Xor: ne32(0)},
 			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ne32(tun.Mark)},
 			gotoTunnel(tun.Name))
 	}
+	return steer
+}
 
-	pre := c.AddChain(&nftables.Chain{
-		Table: t, Name: "prerouting", Type: nftables.ChainTypeFilter,
+// hookChains adds the base chains that jump to steer.
+func (b *builder) hookChains(ingress *nftables.Set, steer *nftables.Chain) {
+	pre := b.c.AddChain(&nftables.Chain{
+		Table: b.t, Name: "prerouting", Type: nftables.ChainTypeFilter,
 		Hooknum: nftables.ChainHookPrerouting, Priority: nftables.ChainPriorityMangle,
 		Policy: policy(nftables.ChainPolicyAccept),
 	})
-	if len(rs.Ingress) > 0 {
-		rule(pre,
+	if len(b.rs.Ingress) > 0 {
+		b.rule(pre,
 			&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
 			&expr.Lookup{SourceRegister: 1, SetName: ingress.Name, SetID: ingress.ID},
 			&expr.Verdict{Kind: expr.VerdictJump, Chain: steer.Name})
 	}
 
-	if rs.LocalOutput {
-		out := c.AddChain(&nftables.Chain{
-			Table: t, Name: "output", Type: nftables.ChainTypeRoute,
+	if b.rs.LocalOutput {
+		out := b.c.AddChain(&nftables.Chain{
+			Table: b.t, Name: "output", Type: nftables.ChainTypeRoute,
 			Hooknum: nftables.ChainHookOutput, Priority: nftables.ChainPriorityMangle,
 			Policy: policy(nftables.ChainPolicyAccept),
 		})
-		rule(out,
+		b.rule(out,
 			&expr.Meta{Key: expr.MetaKeyMARK, Register: 1},
-			&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4, Mask: ne32(rs.Mask), Xor: ne32(0)},
+			&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4, Mask: ne32(b.rs.Mask), Xor: ne32(0)},
 			&expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: ne32(0)},
 			&expr.Verdict{Kind: expr.VerdictReturn})
-		rule(out, &expr.Verdict{Kind: expr.VerdictJump, Chain: steer.Name})
+		b.rule(out, &expr.Verdict{Kind: expr.VerdictJump, Chain: steer.Name})
 	}
-	return nil
 }
 
 // elemChunk bounds the elements per netlink message: all elements of one
