@@ -1,9 +1,11 @@
 package config
 
 import (
+	"net/netip"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The UCI file shipped with the OpenWrt package and the YAML example
@@ -80,6 +82,12 @@ func TestUCITokens(t *testing.T) {
 		`# only a comment`:          nil,
 		`option a 'it''s'`:          {"option", "a", "its"},
 		`list exclude '10.0.0.0/8'`: {"list", "exclude", "10.0.0.0/8"},
+		`option a "x\\y"`:           {"option", "a", `x\y`},
+		`option a 'x\y'`:            {"option", "a", `x\y`}, // no escapes in single quotes
+		`option a b\`:               {"option", "a", `b\`},  // trailing backslash is literal
+		`option a b#c`:              {"option", "a", "b#c"}, // '#' inside a word
+		`option a "#"#c`:            {"option", "a", "##c"}, // a word continues past a quote
+		"option\ta\t'b'":            {"option", "a", "b"},
 	} {
 		got, err := uciTokens(in)
 		if err != nil || !reflect.DeepEqual(got, want) {
@@ -90,6 +98,30 @@ func TestUCITokens(t *testing.T) {
 		if _, err := uciTokens(bad); err == nil {
 			t.Errorf("%q: expected error", bad)
 		}
+	}
+}
+
+func TestUCIHealthOptions(t *testing.T) {
+	c, err := ParseUCI([]byte(uciBase + `
+	list target '198.51.100.2'
+	option probe 'tcp:8443'
+	option interval '30s'
+	option timeout '5s'
+	option min_ok '2'
+	option fail_after '4'
+	option recover_after '6'
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := c.Tunnel("wg-b").Health
+	want := Health{
+		Targets: []netip.Addr{netip.MustParseAddr("198.51.100.1"), netip.MustParseAddr("198.51.100.2")},
+		Probe:   "tcp:8443", Interval: Duration(30 * time.Second), Timeout: Duration(5 * time.Second),
+		MinOK: 2, FailAfter: 4, RecoverAfter: 6, ProbeKind: ProbeTCP, ProbePort: 8443,
+	}
+	if !reflect.DeepEqual(h, want) {
+		t.Errorf("health:\n got %+v\nwant %+v", h, want)
 	}
 }
 

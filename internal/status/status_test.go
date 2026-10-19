@@ -97,3 +97,26 @@ func TestRender(t *testing.T) {
 		}
 	}
 }
+
+// Sections without data are left out instead of rendering empty tables.
+func TestRenderSparse(t *testing.T) {
+	r := Report{
+		Version: "test", Table: "tunsel", StartedAt: time.Now(),
+		Apply:    Apply{At: time.Now(), Error: "nft: rejected"},
+		Warnings: []string{"counters: no table"},
+		Tunnels:  []Tunnel{{Name: "wg-a", Mark: 1}},
+	}
+	var b strings.Builder
+	r.Render(&b)
+	out := b.String()
+	for _, want := range []string{"default: ipv4 none (unmarked)", "last apply FAILED", "warning: counters: no table", "exclude: none"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q:\n%s", want, out)
+		}
+	}
+	for _, unwanted := range []string{"flows at", "RTT history"} {
+		if strings.Contains(out, unwanted) {
+			t.Errorf("output has %q without data:\n%s", unwanted, out)
+		}
+	}
+}

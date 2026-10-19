@@ -190,7 +190,19 @@ func Fetch(path string, req Request) (*Report, error) {
 	return &r, nil
 }
 
+// Render writes the report as text: a header, then one section each for
+// health, latency, traffic and, when requested, flows and RTT history.
 func (r *Report) Render(w io.Writer) {
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	r.renderHeader(w)
+	r.renderHealth(w, tw)
+	r.renderLatency(w, tw)
+	r.renderTraffic(w, tw)
+	r.renderFlows(w, tw)
+	r.renderHistory(w)
+}
+
+func (r *Report) renderHeader(w io.Writer) {
 	fmt.Fprintf(w, "tunsel %s, table inet %s, up %s\n", r.Version, r.Table, time.Since(r.StartedAt).Round(time.Second))
 	fmt.Fprintf(w, "default: ipv4 %s, ipv6 %s\n", orNone(r.Default4), orNone(r.Default6))
 	if r.Apply.Error != "" {
@@ -201,9 +213,10 @@ func (r *Report) Render(w io.Writer) {
 	}
 	c := r.Connections
 	fmt.Fprintf(w, "new connections: %d (excluded %d, local %d, unmarked %d)\n", c.New, c.Excluded, c.Local, c.Unmarked)
+}
 
+func (r *Report) renderHealth(w io.Writer, tw *tabwriter.Writer) {
 	fmt.Fprintln(w)
-	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "TUNNEL\tMARK\tSTATE\tSINCE\tLINK\tLAST ROUND\tSTREAK")
 	for _, t := range r.Tunnels {
 		streak := fmt.Sprintf("%d ok", t.Passes)
@@ -219,7 +232,9 @@ func (r *Report) Render(w io.Writer) {
 			fmt.Fprintf(w, "  %s: %s\n", t.Name, e)
 		}
 	}
+}
 
+func (r *Report) renderLatency(w io.Writer, tw *tabwriter.Writer) {
 	fmt.Fprintln(w)
 	fmt.Fprintln(tw, "TUNNEL\tTARGET\tLAST\tAVG\tMIN\tMAX\tJITTER\tLOSS")
 	for _, t := range r.Tunnels {
@@ -229,7 +244,9 @@ func (r *Report) Render(w io.Writer) {
 		}
 	}
 	tw.Flush()
+}
 
+func (r *Report) renderTraffic(w io.Writer, tw *tabwriter.Writer) {
 	fmt.Fprintln(w)
 	fmt.Fprintln(tw, "TUNNEL\tSTATIC\tDEFAULT\tUPSTREAM\tSTATIC RANGES")
 	for _, t := range r.Tunnels {
@@ -238,28 +255,35 @@ func (r *Report) Render(w io.Writer) {
 	}
 	tw.Flush()
 	fmt.Fprintf(w, "exclude: %s\n", fmtRanges(r.Exclude))
+}
 
-	if f := r.Flows; f != nil {
-		fmt.Fprintf(w, "\nflows at %s (%d entries without a tunnel mark)\n", f.At.Format(time.TimeOnly), f.Other)
-		fmt.Fprintln(tw, "TUNNEL\tFLOWS\tDESTINATIONS\tOUT\tIN\tTOP DESTINATIONS")
-		for _, t := range r.Tunnels {
-			g := f.Tunnels[t.Name]
-			var top []string
-			for _, d := range g.Top[:min(len(g.Top), 3)] {
-				top = append(top, fmt.Sprintf("%s (%s)", d.Addr, fmtBytes(d.Bytes)))
-			}
-			fmt.Fprintf(tw, "%s\t%d\t%d\t%s\t%s\t%s\n", t.Name, g.Flows, g.Destinations,
-				fmtBytes(g.BytesOut), fmtBytes(g.BytesIn), strings.Join(top, ", "))
-		}
-		tw.Flush()
+func (r *Report) renderFlows(w io.Writer, tw *tabwriter.Writer) {
+	f := r.Flows
+	if f == nil {
+		return
 	}
+	fmt.Fprintf(w, "\nflows at %s (%d entries without a tunnel mark)\n", f.At.Format(time.TimeOnly), f.Other)
+	fmt.Fprintln(tw, "TUNNEL\tFLOWS\tDESTINATIONS\tOUT\tIN\tTOP DESTINATIONS")
+	for _, t := range r.Tunnels {
+		g := f.Tunnels[t.Name]
+		var top []string
+		for _, d := range g.Top[:min(len(g.Top), 3)] {
+			top = append(top, fmt.Sprintf("%s (%s)", d.Addr, fmtBytes(d.Bytes)))
+		}
+		fmt.Fprintf(tw, "%s\t%d\t%d\t%s\t%s\t%s\n", t.Name, g.Flows, g.Destinations,
+			fmtBytes(g.BytesOut), fmtBytes(g.BytesIn), strings.Join(top, ", "))
+	}
+	tw.Flush()
+}
 
-	if hasHistory(r) {
-		fmt.Fprintln(w, "\nRTT history, oldest first (· = lost)")
-		for _, t := range r.Tunnels {
-			for _, h := range t.History {
-				fmt.Fprintf(w, "  %s %s %s\n", t.Name, h.Target, sparkline(h.Samples))
-			}
+func (r *Report) renderHistory(w io.Writer) {
+	if !hasHistory(r) {
+		return
+	}
+	fmt.Fprintln(w, "\nRTT history, oldest first (· = lost)")
+	for _, t := range r.Tunnels {
+		for _, h := range t.History {
+			fmt.Fprintf(w, "  %s %s %s\n", t.Name, h.Target, sparkline(h.Samples))
 		}
 	}
 }
