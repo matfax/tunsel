@@ -138,12 +138,21 @@ jobs:
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: bin/*.ipk
-      # One SBOM for all packages: the Go modules their binaries are built from.
+      # One SBOM for all packages, from what they install: syft reads the Go
+      # modules from each binary's build info.
+      - name: unpack packages
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          for ipk in bin/*.ipk; do
+            dir=sbom-root/$(basename "$ipk" .ipk)
+            mkdir -p "$dir"
+            tar -xzOf "$ipk" ./data.tar.gz | tar -xz -C "$dir"
+          done
       - name: generate SBOM
         if: startsWith(github.ref, 'refs/tags/v')
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
-          path: .
+          path: sbom-root
           format: spdx-json
           output-file: bin/tunsel.spdx.json
           upload-release-assets: false
