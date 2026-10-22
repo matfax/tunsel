@@ -462,6 +462,7 @@ learning:
   enabled: true
   candidates: { refresh: 1s }
   probe: { timeout: 500ms }
+  ttl: 6s # renewed from 2s before expiry while the flow is in conntrack
 log: { level: debug }
 status: { socket: %s }
 `
@@ -469,7 +470,8 @@ status: { socket: %s }
 // Learning from conntrack: of two destinations the LAN talks to via the
 // default wg-b, one only wg-a answers on TCP 443; it is learned for wg-a
 // and its next connection goes there. The other, which both answer alike,
-// stays on the default. A restart keeps what was learned.
+// stays on the default. While in use, the learned entry is renewed before
+// it expires; a restart keeps it.
 func TestLearning(t *testing.T) {
 	topology(t)
 	bin := filepath.Join(t.TempDir(), "tunsel")
@@ -512,8 +514,23 @@ func TestLearning(t *testing.T) {
 	if r := d.report(t); r.Tunnels[0].Learned < 1 || r.Learning.Learned != 1 || r.Learning.LastError != "" {
 		t.Errorf("report: wg-a learned %d, %+v", r.Tunnels[0].Learned, r.Learning)
 	}
-	if !strings.Contains(sh(t, nsRtr, "nft list map inet tunsel learned4"), dstLearn+" timeout 1h") {
+	if !strings.Contains(sh(t, nsRtr, "nft list map inet tunsel learned4"), dstLearn+" timeout 6s") {
 		t.Error("learned element missing")
+	}
+
+	// Renewed in place: still there after its first lifetime, and new
+	// connections never fell back to the default meanwhile.
+	first := expires(t, d, dstLearn)
+	for end := time.Now().Add(8 * time.Second); time.Now().Before(end); time.Sleep(time.Second) {
+		if got := via(t, nsLAN, "ping -n -q -c 1 -W 1 "+dstLearn); got != "wg-a" {
+			t.Fatalf("learned destination via %s while being renewed", got)
+		}
+	}
+	if again := expires(t, d, dstLearn); !again.After(first.Add(time.Second)) {
+		t.Errorf("not renewed: expiry %s, first %s", again, first)
+	}
+	if r := d.report(t); r.Learning.Renewals == 0 && !strings.Contains(d.log.String(), "msg=renewed") {
+		t.Errorf("no renewal reported: %+v", r.Learning)
 	}
 
 	// A restart adopts the installed entry instead of forgetting it.
@@ -532,4 +549,19 @@ func TestLearning(t *testing.T) {
 	if !strings.Contains(d.log.String(), "adopted learned destinations") {
 		t.Error("adoption not logged")
 	}
+}
+
+func expires(t *testing.T, d *daemon, addr string) time.Time {
+	t.Helper()
+	r, err := status.Fetch(d.socket, status.Request{Learned: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range r.Learning.Entries {
+		if e.Addr.String() == addr {
+			return e.Expires
+		}
+	}
+	t.Fatalf("%s not measured", addr)
+	return time.Time{}
 }

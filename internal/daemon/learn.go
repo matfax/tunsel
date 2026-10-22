@@ -117,20 +117,21 @@ func (d *Daemon) learnRound(ctx context.Context, cfg *config.Config, src learn.S
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.cfg == cfg {
-		d.commitLocked(cfg, jobs, time.Now())
+		d.commitLocked(cfg, jobs, d.opts.Now())
 	}
 }
 
-// planRound records the round and picks the destinations to measure.
+// planRound records the round and picks the destinations to measure: new
+// ones and those whose record is due for renewal.
 func (d *Daemon) planRound(cfg *config.Config, cands []learn.Candidate, err error) []*learnJob {
-	now := time.Now()
+	now := d.opts.Now()
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.cfg != cfg {
 		return nil
 	}
 	st := &d.learnStat
-	st.LastRound, st.Seen, st.Measured, st.LastError = now, len(cands), 0, ""
+	st.LastRound, st.Seen, st.Measured, st.Renewals, st.LastError = now, len(cands), 0, 0, ""
 	if err != nil {
 		st.LastError = err.Error()
 		d.log.Warn("learning: reading candidates failed", "source", cfg.Learning.Candidates.Source, "err", err)
@@ -139,23 +140,31 @@ func (d *Daemon) planRound(cfg *config.Config, cands []learn.Candidate, err erro
 	d.learner.Prune(now, cfg.Learning.FlapDamp.Window.D())
 	healthy := d.healthyLocked()
 	var jobs []*learnJob
-	for _, c := range d.learner.Select(cands, cfg.Learning.Candidates.TopN, func(a netip.Addr) bool { return d.eligibleLocked(cfg, healthy, a) }) {
+	eligible := func(a netip.Addr) bool { return d.eligibleLocked(cfg, healthy, a) }
+	for _, c := range d.learner.Select(cands, cfg.Learning.Candidates.TopN, eligible, now, learn.RenewBefore(&cfg.Learning)) {
 		jobs = append(jobs, &learnJob{cand: c, tunnels: carriers(cfg, healthy, c.Addr)})
+		if d.learner.Trained(c.Addr) {
+			st.Renewals++
+		}
 	}
 	st.Measured = len(jobs)
 	return jobs
 }
 
-// commitLocked decides each measured destination against its baseline as
-// of now, installs the learned ones in nft and keeps every record.
+// commitLocked decides each measured destination against its baseline
+// and current tunnel as of now, updates nft and keeps every record. A
+// renewed destination's element is replaced in the same transaction, so
+// it stays steered throughout.
 func (d *Daemon) commitLocked(cfg *config.Config, jobs []*learnJob, now time.Time) {
 	healthy := d.healthyLocked()
+	renew := learn.RenewBefore(&cfg.Learning)
 	var recs []*learn.Record
-	var adds []nft.Learned
+	var changes []learnChange
 	for _, j := range jobs {
+		addr := j.cand.Addr
 		// Health may have changed while measuring.
-		baseline, static := engine.Route(cfg, healthy, d.defaults, j.cand.Addr)
-		if static || d.learner.Trained(j.cand.Addr) {
+		baseline, static := engine.Route(cfg, healthy, d.defaults, addr)
+		if static || d.learner.Fresh(addr, now, renew) {
 			continue
 		}
 		rtt := map[string]time.Duration{}
@@ -164,14 +173,22 @@ func (d *Daemon) commitLocked(cfg *config.Config, jobs []*learnJob, now time.Tim
 				rtt[n] = v
 			}
 		}
-		r := d.learner.Decide(j.cand, rtt, baseline, healthy, &cfg.Learning, now)
+		current := d.learner.Current(addr)
+		r := d.learner.Decide(j.cand, rtt, baseline, current, healthy, &cfg.Learning, now)
+		var ch learnChange
+		if current != "" {
+			ch.remove = &nft.Learned{Addr: addr, Tunnel: current}
+		}
 		if r.Tunnel != "" {
-			adds = append(adds, nft.Learned{Addr: r.Addr, Tunnel: r.Tunnel, Timeout: cfg.Learning.TTL.D()})
+			ch.add = &nft.Learned{Addr: addr, Tunnel: r.Tunnel, Timeout: cfg.Learning.TTL.D()}
+		}
+		if ch.remove != nil || ch.add != nil {
+			changes = append(changes, ch)
 		}
 		recs = append(recs, r)
 	}
-	if failed := d.addLearnedLocked(cfg, adds); len(failed) > 0 {
-		// Measured again next round.
+	if failed := d.updateLearnedLocked(cfg, changes); len(failed) > 0 {
+		// Keep the previous records; measured again next round.
 		kept := recs[:0]
 		for _, r := range recs {
 			if !failed[r.Addr] {
@@ -181,41 +198,70 @@ func (d *Daemon) commitLocked(cfg *config.Config, jobs []*learnJob, now time.Tim
 		recs = kept
 	}
 	for _, r := range recs {
+		was := d.learner.Current(r.Addr)
 		d.learner.Store(r)
-		if r.Tunnel != "" {
-			d.log.Info("learned", "addr", r.Addr, "tunnel", r.Tunnel, "baseline", r.Baseline, "outcome", r.Outcome, "rtt", fmtRTT(r.RTT))
-		} else {
+		switch {
+		case r.Tunnel != "" && r.Tunnel == was:
+			d.log.Debug("renewed", "addr", r.Addr, "tunnel", r.Tunnel, "baseline", r.Baseline, "rtt", fmtRTT(r.RTT))
+		case r.Tunnel != "":
+			d.log.Info("learned", "addr", r.Addr, "tunnel", r.Tunnel, "was", was, "baseline", r.Baseline, "outcome", r.Outcome, "rtt", fmtRTT(r.RTT))
+		case was != "":
+			d.log.Info("unlearned", "addr", r.Addr, "was", was, "baseline", r.Baseline, "outcome", r.Outcome, "rtt", fmtRTT(r.RTT))
+		default:
 			d.log.Debug("measured", "addr", r.Addr, "baseline", r.Baseline, "outcome", r.Outcome, "rtt", fmtRTT(r.RTT))
 		}
 	}
 }
 
-// addLearnedLocked installs adds and returns the addresses that failed.
-// One element nft rejects (an address with a stale element for another
-// tunnel) fails the whole transaction, so a failed batch is retried one
-// element at a time.
-func (d *Daemon) addLearnedLocked(cfg *config.Config, adds []nft.Learned) map[netip.Addr]bool {
-	if len(adds) == 0 {
+// learnChange replaces, adds or removes the element of one destination.
+type learnChange struct {
+	remove, add *nft.Learned
+}
+
+// updateLearnedLocked applies changes and returns the addresses that
+// failed. One element nft rejects (an address with a stale element for
+// another tunnel) fails the whole transaction, so a failed batch is
+// retried one destination at a time.
+func (d *Daemon) updateLearnedLocked(cfg *config.Config, changes []learnChange) map[netip.Addr]bool {
+	if len(changes) == 0 {
 		return nil
 	}
-	err := d.opts.NFT.AddLearned(cfg.NFT.Table, adds)
+	apply := func(cs []learnChange) error {
+		var remove, add []nft.Learned
+		for _, c := range cs {
+			if c.remove != nil {
+				remove = append(remove, *c.remove)
+			}
+			if c.add != nil {
+				add = append(add, *c.add)
+			}
+		}
+		return d.opts.NFT.UpdateLearned(cfg.NFT.Table, remove, add)
+	}
+	err := apply(changes)
 	if err == nil {
 		return nil
 	}
+	addr := func(c learnChange) netip.Addr {
+		if c.add != nil {
+			return c.add.Addr
+		}
+		return c.remove.Addr
+	}
 	failed := map[netip.Addr]bool{}
-	if len(adds) > 1 {
+	if len(changes) > 1 {
 		err = nil
-		for _, l := range adds {
-			if e := d.opts.NFT.AddLearned(cfg.NFT.Table, []nft.Learned{l}); e != nil {
-				failed[l.Addr], err = true, e
+		for _, c := range changes {
+			if e := apply([]learnChange{c}); e != nil {
+				failed[addr(c)], err = true, e
 			}
 		}
 	} else {
-		failed[adds[0].Addr] = true
+		failed[addr(changes[0])] = true
 	}
 	if err != nil {
-		d.learnStat.LastError = fmt.Sprintf("nft: %d of %d learned destinations not installed: %v", len(failed), len(adds), err)
-		d.log.Error("learning: nft add failed", "failed", len(failed), "of", len(adds), "err", err)
+		d.learnStat.LastError = fmt.Sprintf("nft: %d of %d learned destinations not updated: %v", len(failed), len(changes), err)
+		d.log.Error("learning: nft update failed", "failed", len(failed), "of", len(changes), "err", err)
 	}
 	return failed
 }

@@ -132,7 +132,7 @@ function learningOptions(s) {
 		_('A tunnel replaces the default only if it is faster by this much…'), '5ms', duration);
 	value('learn_min_gain_rel', _('Minimum relative gain'), _('…and by this share.'), '15%', percent);
 	value('learn_ttl', _('Lifetime'),
-		_('How long a measurement is kept; the destination is measured again only after it expires.'), '1h', duration);
+		_('How long a measurement is kept. A destination still in use is measured again from two refresh intervals before it expires, and its tunnel renewed or changed without a gap.'), '1h', duration);
 	value('learn_damp_window', _('Damping window'), null, '30m', duration);
 	value('learn_damp_max_switches', _('Switches per window'),
 		_('At most this many tunnel changes per destination within the damping window.'), '2', count);

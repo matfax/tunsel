@@ -202,6 +202,66 @@ func TestLearningAddRetries(t *testing.T) {
 	}
 }
 
+// A destination still in use is measured again from two refreshes before
+// its record expires: the same tunnel is renewed in place, a baseline
+// that became faster removes it. One no longer in use just expires.
+func TestLearningRenewal(t *testing.T) {
+	h, ctx := learnHarness(t)
+	start := time.Now()
+	now := start
+	h.d.opts.Now = func() time.Time { return now }
+	rtt := h.d.opts.Health.Prober.(tcpProbes).rtt
+	round := func(at time.Duration, src fixedSource) *status.Learning {
+		t.Helper()
+		now = start.Add(at)
+		h.d.learnRound(ctx, h.d.cfg, src)
+		return h.d.report(status.Request{Learned: true}).Learning
+	}
+	expiry := func(addr string) time.Time {
+		for _, e := range h.d.report(status.Request{Learned: true}).Learning.Entries {
+			if e.Addr == a(addr) {
+				return e.Expires
+			}
+		}
+		return time.Time{}
+	}
+
+	round(0, cands)
+	if l := round(49*time.Minute, cands); l.Measured != 0 {
+		t.Fatalf("measured before the renewal window: %+v", l)
+	}
+	// Due at 50 min (1 h TTL, 10 min ahead at the default 5 min refresh).
+	l := round(51*time.Minute, cands)
+	if l.Measured != 2 || l.Renewals != 2 || l.Learned != 1 {
+		t.Fatalf("renewal round: %+v", l)
+	}
+	adds, removes := h.tables.adds(), h.tables.removes()
+	last := len(adds) - 1
+	if len(adds) != 2 || len(adds[last]) != 1 || adds[last][0] != (nft.Learned{Addr: a("198.18.0.1"), Tunnel: "wg-a", Timeout: time.Hour}) ||
+		len(removes[last]) != 1 || removes[last][0].Addr != a("198.18.0.1") || removes[last][0].Tunnel != "wg-a" {
+		t.Fatalf("renewal update: add %+v, remove %+v", adds, removes)
+	}
+	if got := expiry("198.18.0.1"); !got.Equal(start.Add(51*time.Minute + time.Hour)) {
+		t.Errorf("renewed expiry: %s", got.Sub(start))
+	}
+
+	// The baseline overtook it: the element goes, the destination stays
+	// on the default.
+	rtt["wg-b"][a("198.18.0.1")] = 5 * time.Millisecond
+	l = round(51*time.Minute+51*time.Minute, cands)
+	adds, removes = h.tables.adds(), h.tables.removes()
+	last = len(adds) - 1
+	if l.Learned != 0 || len(adds[last]) != 0 || len(removes[last]) != 1 || removes[last][0].Tunnel != "wg-a" {
+		t.Errorf("baseline took over: %+v, add %+v, remove %+v", l, adds[last], removes[last])
+	}
+
+	// No longer in conntrack: not measured, and gone once expired.
+	l = round(4*time.Hour, nil)
+	if l.Measured != 0 || l.Learned != 0 || l.Kept != 0 {
+		t.Errorf("unused destinations kept: %+v", l)
+	}
+}
+
 // The loop runs a round at start and stops with its context.
 func TestLearningLoop(t *testing.T) {
 	h, ctx := learnHarness(t)

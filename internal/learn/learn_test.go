@@ -69,8 +69,35 @@ func TestDecide(t *testing.T) {
 		{map[string]time.Duration{"wg-a": ms(300)}, Learned, "wg-a"}, // the baseline did not answer
 		{map[string]time.Duration{}, NoAnswer, ""},
 	} {
-		r := l.Decide(c, tc.rtt, "wg-b", all, params(), now)
+		r := l.Decide(c, tc.rtt, "wg-b", "", all, params(), now)
 		if r.Outcome != tc.outcome || r.Tunnel != tc.tunnel || !r.Expires.Equal(now.Add(time.Hour)) {
+			t.Errorf("%v: %s %q, want %s %q", tc.rtt, r.Outcome, r.Tunnel, tc.outcome, tc.tunnel)
+		}
+	}
+}
+
+// On renewal, the current tunnel is kept unless another beats it by
+// min_gain; the baseline taking over removes the learned tunnel.
+func TestDecideRenewal(t *testing.T) {
+	l := New()
+	now := time.Now()
+	c := Candidate{Addr: addr("198.18.0.1")}
+	for _, tc := range []struct {
+		rtt     map[string]time.Duration
+		outcome string
+		tunnel  string
+	}{
+		{map[string]time.Duration{"wg-a": ms(20), "wg-b": ms(40), "wg-c": ms(60)}, Learned, "wg-a"},
+		{map[string]time.Duration{"wg-a": ms(20), "wg-b": ms(18), "wg-c": ms(60)}, Learned, "wg-a"}, // baseline faster, by too little
+		{map[string]time.Duration{"wg-a": ms(20), "wg-b": ms(20), "wg-c": ms(20)}, Learned, "wg-a"}, // ties keep it
+		{map[string]time.Duration{"wg-a": ms(40), "wg-b": ms(20), "wg-c": ms(60)}, Baseline, ""},
+		{map[string]time.Duration{"wg-a": ms(40), "wg-b": ms(60), "wg-c": ms(20)}, Learned, "wg-c"},
+		{map[string]time.Duration{"wg-a": ms(40), "wg-b": ms(38), "wg-c": ms(37)}, Learned, "wg-a"},
+		{map[string]time.Duration{"wg-b": ms(40), "wg-c": ms(39)}, NoGain, ""}, // wg-a silent; wg-c not enough over the baseline
+		{map[string]time.Duration{}, NoAnswer, ""},
+	} {
+		r := l.Decide(c, tc.rtt, "wg-b", "wg-a", all, params(), now)
+		if r.Outcome != tc.outcome || r.Tunnel != tc.tunnel {
 			t.Errorf("%v: %s %q, want %s %q", tc.rtt, r.Outcome, r.Tunnel, tc.outcome, tc.tunnel)
 		}
 	}
@@ -87,7 +114,7 @@ func TestDamping(t *testing.T) {
 	fastC := map[string]time.Duration{"wg-a": ms(50), "wg-b": ms(50), "wg-c": ms(10)}
 	fastB := map[string]time.Duration{"wg-a": ms(50), "wg-b": ms(10), "wg-c": ms(50)}
 	step := func(rtt map[string]time.Duration) *Record {
-		r := l.Decide(c, rtt, "wg-b", all, p, now)
+		r := l.Decide(c, rtt, "wg-b", l.Current(c.Addr), all, p, now)
 		l.Store(r)
 		now = now.Add(time.Minute)
 		return r
@@ -125,9 +152,17 @@ func TestSelectAndPrune(t *testing.T) {
 	}
 	eligible := func(a netip.Addr) bool { return !a.IsPrivate() }
 	l.Store(&Record{Addr: addr("198.18.0.2"), Baseline: "wg-b", Decided: now, Expires: now.Add(time.Minute)})
-	got := l.Select(cands, 2, eligible)
+	got := l.Select(cands, 2, eligible, now, 0)
 	if len(got) != 2 || got[0].Addr != addr("198.18.0.4") || got[1].Addr != addr("198.18.0.3") {
 		t.Errorf("select: %+v", got)
+	}
+	// Due for renewal ahead of its expiry, the record no longer keeps the
+	// destination out.
+	if got := l.Select(cands, 1, eligible, now.Add(45*time.Second), 20*time.Second); len(got) != 1 || got[0].Addr != addr("198.18.0.2") {
+		t.Errorf("select in the renewal window: %+v", got)
+	}
+	if !l.Fresh(addr("198.18.0.2"), now.Add(39*time.Second), 20*time.Second) || l.Fresh(addr("198.18.0.2"), now.Add(41*time.Second), 20*time.Second) {
+		t.Error("Fresh")
 	}
 
 	l.Prune(now.Add(time.Minute+Grace/2), time.Hour)
@@ -138,7 +173,7 @@ func TestSelectAndPrune(t *testing.T) {
 	if l.Trained(addr("198.18.0.2")) {
 		t.Error("not pruned after expiry")
 	}
-	if got := l.Select(cands, 5, eligible); len(got) != 4 || got[0].Addr != addr("198.18.0.2") {
+	if got := l.Select(cands, 5, eligible, now.Add(time.Hour), 0); len(got) != 4 || got[0].Addr != addr("198.18.0.2") {
 		t.Errorf("select after expiry: %+v", got)
 	}
 
@@ -147,6 +182,18 @@ func TestSelectAndPrune(t *testing.T) {
 	l.Drop(func(r *Record) bool { return r.Tunnel == "wg-a" })
 	if rs := l.Records(); len(rs) != 1 || rs[0].Addr != addr("198.18.0.3") {
 		t.Errorf("records after drop: %+v", rs)
+	}
+}
+
+func TestRenewBefore(t *testing.T) {
+	p := params()
+	p.Candidates.Refresh = config.Duration(5 * time.Minute)
+	if got := RenewBefore(p); got != 10*time.Minute {
+		t.Errorf("default: %s", got)
+	}
+	p.Candidates.Refresh = config.Duration(45 * time.Minute)
+	if got := RenewBefore(p); got != 30*time.Minute {
+		t.Errorf("capped at half the TTL: %s", got)
 	}
 }
 

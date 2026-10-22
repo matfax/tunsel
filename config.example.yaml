@@ -74,7 +74,7 @@ learning:
   min_gain:                # beat the default by both, or keep it
     abs: 5ms
     rel: 15%
-  ttl: 1h                  # a destination is measured again after this
+  ttl: 1h                  # lifetime; renewed from 2 refreshes before, if in use
   flap_damping:
     window: 30m            # at most max_switches changes per destination
     max_switches: 2        # within window

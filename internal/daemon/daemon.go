@@ -48,6 +48,8 @@ type Options struct {
 	// LearnSource builds the learning candidate source for cfg. Defaults
 	// to conntrack.
 	LearnSource func(cfg *config.Config) learn.Source
+	// Now is the clock of learning. Defaults to time.Now.
+	Now func() time.Time
 }
 
 // Tables is the nftables side; *nft.Manager in production.
@@ -57,7 +59,7 @@ type Tables interface {
 	Delete(table string) error
 	Defaults(table string) (v4, v6 string, err error)
 	Counters(table string) (map[string]nft.Counter, error)
-	AddLearned(table string, ls []nft.Learned) error
+	UpdateLearned(table string, remove, add []nft.Learned) error
 	Learned(table string, tunnels []string) ([]nft.Learned, error)
 }
 
@@ -99,6 +101,9 @@ func New(cfg *config.Config, opts Options) *Daemon {
 	}
 	if opts.DumpFlows == nil {
 		opts.DumpFlows = flows.Dump
+	}
+	if opts.Now == nil {
+		opts.Now = time.Now
 	}
 	return &Daemon{
 		opts: opts, log: opts.Log, cfg: cfg, events: make(chan health.Event, 16),
@@ -178,7 +183,7 @@ func (d *Daemon) adoptInstalledLearned() {
 		d.log.Warn("reading installed learned destinations", "err", err)
 		return
 	}
-	now := time.Now()
+	now := d.opts.Now()
 	for _, l := range ls {
 		d.learner.Store(&learn.Record{Addr: l.Addr, Tunnel: l.Tunnel, Outcome: learn.Learned, Decided: now, Expires: now.Add(l.Timeout)})
 	}
@@ -304,7 +309,7 @@ func (d *Daemon) applyLocked(cfg *config.Config, monitors map[string]*health.Mon
 	}
 	healthy := func(n string) bool { return states[n] == health.Healthy }
 	rs, defs := engine.Build(cfg, healthy, d.defaults)
-	rs.Learned = d.learnedLocked(cfg, healthy, time.Now())
+	rs.Learned = d.learnedLocked(cfg, healthy, d.opts.Now())
 	if err := d.opts.NFT.Apply(rs, alsoDelete...); err != nil {
 		d.apply = status.Apply{At: time.Now(), Error: err.Error()}
 		d.log.Error("nft apply failed", "err", err)

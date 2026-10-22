@@ -192,7 +192,7 @@ function summary(r) {
 function learningSummary(l) {
 	const out = [ _('%s every %s; %s destinations learned, %s kept on their baseline').format(l.source, l.refresh, count(l.learned), count(l.kept)) ];
 	out.push(l.last_round && !l.last_round.startsWith('0001-')
-		? _('last round %s ago: %s seen, %s measured').format(since(l.last_round), count(l.seen), count(l.measured))
+		? _('last round %s ago: %s seen, %s measured (%s renewals)').format(since(l.last_round), count(l.seen), count(l.measured), count(l.renewals))
 		: _('no round yet'));
 	if (l.last_error)
 		out.push(E('strong', {}, [ text(_('failed: %s').format(l.last_error)) ]));

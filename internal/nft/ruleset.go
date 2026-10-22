@@ -12,8 +12,9 @@
 // install rather than from the last change.
 //
 // Learned destinations (design §7) are single addresses with their own
-// timeout. Between table replacements, AddLearned adds them as elements,
-// so a learning round never rebuilds the table; the kernel expires them.
+// timeout. Between table replacements, UpdateLearned adds, renews and
+// removes them as elements, so a learning round never rebuilds the table;
+// the kernel expires them.
 //
 //	table inet tunsel {
 //	  counter new; counter local; counter excluded
@@ -212,15 +213,26 @@ func (m *Manager) Defaults(table string) (v4, v6 string, err error) {
 	return v4, v6, err
 }
 
-// AddLearned adds learned destinations to the installed table in one
-// transaction. An address must not have a live element already; the
-// caller only adds destinations without one.
-func (m *Manager) AddLearned(table string, ls []Learned) error {
+// UpdateLearned removes and adds learned destinations of the installed
+// table in one transaction, so a destination being renewed or moved to
+// another tunnel is never without its element. Each removal names the
+// tunnel the element points to now; it is first added again, which is a
+// no-op while it exists and keeps the deletion from failing when the
+// kernel has just expired it. An address must not have a live element for
+// another tunnel than the one a removal names.
+func (m *Manager) UpdateLearned(table string, remove, add []Learned) error {
 	known := map[string]bool{}
-	for _, l := range ls {
+	for _, l := range append(append([]Learned{}, remove...), add...) {
 		known[l.Tunnel] = true
 	}
-	if err := checkLearned(ls, known); err != nil {
+	ensure := make([]Learned, len(remove))
+	for i, l := range remove {
+		ensure[i] = Learned{Addr: l.Addr, Tunnel: l.Tunnel, Timeout: time.Second}
+	}
+	if err := checkLearned(ensure, known); err != nil {
+		return err
+	}
+	if err := checkLearned(add, known); err != nil {
 		return err
 	}
 	c, err := nftables.New(append([]nftables.ConnOption{nftables.WithSockOptions(largeBuffers)}, m.Opts...)...)
@@ -229,15 +241,21 @@ func (m *Manager) AddLearned(table string, ls []Learned) error {
 	}
 	t := &nftables.Table{Family: nftables.TableFamilyINet, Name: table}
 	l4, l6 := learnedSets(t)
-	e4, e6 := learnedElems(ls)
-	for _, e := range []struct {
+	r4, r6 := learnedElems(ensure)
+	a4, a6 := learnedElems(add)
+	for _, op := range []struct {
+		do    func(*nftables.Set, []nftables.SetElement) error
 		set   *nftables.Set
 		elems []nftables.SetElement
-	}{{l4, e4}, {l6, e6}} {
-		for rest := e.elems; len(rest) > 0; {
+	}{
+		{c.SetAddElements, l4, r4}, {c.SetAddElements, l6, r6},
+		{c.SetDeleteElements, l4, r4}, {c.SetDeleteElements, l6, r6},
+		{c.SetAddElements, l4, a4}, {c.SetAddElements, l6, a6},
+	} {
+		for rest := op.elems; len(rest) > 0; {
 			n := min(len(rest), elemChunk)
-			if err := c.SetAddElements(e.set, rest[:n]); err != nil {
-				return fmt.Errorf("set %s: %w", e.set.Name, err)
+			if err := op.do(op.set, rest[:n]); err != nil {
+				return fmt.Errorf("set %s: %w", op.set.Name, err)
 			}
 			rest = rest[n:]
 		}

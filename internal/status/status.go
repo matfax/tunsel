@@ -77,10 +77,12 @@ type Learning struct {
 	Refresh   string    `json:"refresh"`
 	LastRound time.Time `json:"last_round"`
 	LastError string    `json:"last_error,omitempty"`
-	// Of the last round: candidates the source reported, and those
-	// measured (untrained and eligible, at most top_n).
+	// Of the last round: candidates the source reported, those measured
+	// (eligible and new or due for renewal, at most top_n), and of these
+	// the renewals.
 	Seen     int `json:"seen"`
 	Measured int `json:"measured"`
+	Renewals int `json:"renewals"`
 	// Live records: with a learned tunnel in nft, and without one (the
 	// baseline was fastest, the gain too small, no answer or damped).
 	Learned int `json:"learned"`
@@ -249,7 +251,7 @@ func (r *Report) renderHeader(w io.Writer) {
 	if l := r.Learning; l != nil {
 		last := "no round yet"
 		if !l.LastRound.IsZero() {
-			last = fmt.Sprintf("last round %s ago: %d seen, %d measured", time.Since(l.LastRound).Round(time.Second), l.Seen, l.Measured)
+			last = fmt.Sprintf("last round %s ago: %d seen, %d measured (%d renewals)", time.Since(l.LastRound).Round(time.Second), l.Seen, l.Measured, l.Renewals)
 		}
 		fmt.Fprintf(w, "learning: %s every %s, %s; %d destinations learned, %d kept on their baseline\n", l.Source, l.Refresh, last, l.Learned, l.Kept)
 		if l.LastError != "" {

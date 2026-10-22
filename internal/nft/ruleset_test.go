@@ -390,7 +390,7 @@ func TestLearned(t *testing.T) {
 	if err := m.Apply(rs); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.AddLearned("tunsel", []Learned{
+	if err := m.UpdateLearned("tunsel", nil, []Learned{
 		{netip.MustParseAddr("198.18.0.2"), "wg-b", 10 * time.Minute},
 		{netip.MustParseAddr("2001:db8:1::1"), "wg-b", time.Minute},
 	}); err != nil {
@@ -406,7 +406,7 @@ func TestLearned(t *testing.T) {
 			t.Errorf("learned maps lack %q:\n%s", w, got)
 		}
 	}
-	if err := m.AddLearned("tunsel", []Learned{{netip.MustParseAddr("198.18.0.3"), "nope", time.Hour}}); err == nil {
+	if err := m.UpdateLearned("tunsel", nil, []Learned{{netip.MustParseAddr("198.18.0.3"), "nope", time.Hour}}); err == nil {
 		t.Error("unknown tunnel accepted")
 	}
 
@@ -441,6 +441,44 @@ func TestLearned(t *testing.T) {
 	}
 	if got := run("nft", "list", "map", "inet", "tunsel", "learned4"); strings.Contains(got, "198.18") {
 		t.Errorf("replacement kept elements:\n%s", got)
+	}
+}
+
+// A renewal resets the timeout, a move changes the tunnel and a removal
+// drops the element, all in place; a removal also works when the element
+// is already gone.
+func TestUpdateLearned(t *testing.T) {
+	m, run := netns(t)
+	if err := m.Apply(sample()); err != nil {
+		t.Fatal(err)
+	}
+	a, b := netip.MustParseAddr("198.18.0.1"), netip.MustParseAddr("2001:db8:1::1")
+	list := func() string {
+		return run("nft", "list", "map", "inet", "tunsel", "learned4") + run("nft", "list", "map", "inet", "tunsel", "learned6")
+	}
+	if err := m.UpdateLearned("tunsel", nil, []Learned{{a, "wg-a", time.Minute}, {b, "wg-a", time.Minute}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range []struct {
+		name           string
+		remove, add    []Learned
+		want, unwanted string
+	}{
+		{"renew", []Learned{{a, "wg-a", 0}}, []Learned{{a, "wg-a", time.Hour}}, "198.18.0.1 timeout 1h expires", "198.18.0.1 timeout 1m"},
+		{"move", []Learned{{b, "wg-a", 0}}, []Learned{{b, "wg-b", time.Hour}}, "2001:db8:1::1 timeout 1h expires 59m", "2001:db8:1::1 timeout 1m"},
+		{"remove", []Learned{{a, "wg-a", 0}}, nil, "learned_wg_b", "198.18.0.1"},
+		{"remove a missing element", []Learned{{a, "wg-a", 0}}, []Learned{{a, "wg-b", time.Hour}}, "198.18.0.1 timeout 1h", ""},
+	} {
+		if err := m.UpdateLearned("tunsel", step.remove, step.add); err != nil {
+			t.Fatalf("%s: %v", step.name, err)
+		}
+		got := list()
+		if !strings.Contains(got, step.want) || step.unwanted != "" && strings.Contains(got, step.unwanted) {
+			t.Errorf("%s: want %q, not %q:\n%s", step.name, step.want, step.unwanted, got)
+		}
+	}
+	if got := run("nft", "list", "map", "inet", "tunsel", "learned6"); !strings.Contains(got, ": goto learned_wg_b") || strings.Contains(got, "learned_wg_a") {
+		t.Errorf("moved element:\n%s", got)
 	}
 }
 

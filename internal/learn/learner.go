@@ -14,9 +14,9 @@ import (
 
 // Outcomes of a measurement.
 const (
-	Learned  = "learned"   // a faster tunnel than the baseline; installed in nft
+	Learned  = "learned"   // a faster tunnel than the baseline, or kept on renewal; installed in nft
 	Baseline = "baseline"  // the baseline was fastest
-	NoGain   = "no gain"   // faster, but below min_gain
+	NoGain   = "no gain"   // a faster tunnel, but not by min_gain; stays on the baseline
 	NoAnswer = "no answer" // no tunnel completed a handshake
 	Damped   = "damped"    // too many changes within flap_damping.window
 )
@@ -26,7 +26,9 @@ const (
 const Grace = 2 * time.Second
 
 // Record is the result of measuring one destination. Every outcome is kept
-// until Expires, so a destination is not measured again before then.
+// until Expires. The destination is not measured again before RenewBefore
+// ahead of that; from then on, if it is still in use, it is measured again
+// and the new record replaces this one before it expires.
 type Record struct {
 	Addr netip.Addr `json:"addr"`
 	// Tunnel is the learned tunnel; "" leaves the destination to its
@@ -86,6 +88,28 @@ func (l *Learner) Drop(drop func(*Record) bool) {
 // Trained reports whether addr has a record.
 func (l *Learner) Trained(addr netip.Addr) bool { return l.records[addr] != nil }
 
+// Current returns the learned tunnel of addr, or "".
+func (l *Learner) Current(addr netip.Addr) string {
+	if r := l.records[addr]; r != nil {
+		return r.Tunnel
+	}
+	return ""
+}
+
+// Fresh reports whether addr has a record that is not yet due for renewal
+// at now.
+func (l *Learner) Fresh(addr netip.Addr, now time.Time, renew time.Duration) bool {
+	r := l.records[addr]
+	return r != nil && now.Before(r.Expires.Add(-renew))
+}
+
+// RenewBefore is how long before its expiry a record stops keeping its
+// destination from being measured: two refreshes, so a destination still
+// in use gets two chances to be renewed, but at most half the TTL.
+func RenewBefore(p *config.Learning) time.Duration {
+	return min(2*p.Candidates.Refresh.D(), p.TTL.D()/2)
+}
+
 // Records returns the records, most recent decision first.
 func (l *Learner) Records() []Record {
 	out := make([]Record, 0, len(l.records))
@@ -102,11 +126,12 @@ func (l *Learner) Records() []Record {
 }
 
 // Select returns up to n candidates, the most used first, that have no
-// record and that eligible accepts. Untrained destinations get every slot.
-func (l *Learner) Select(cands []Candidate, n int, eligible func(netip.Addr) bool) []Candidate {
+// fresh record (see Fresh) and that eligible accepts. Destinations measured
+// recently get no slot.
+func (l *Learner) Select(cands []Candidate, n int, eligible func(netip.Addr) bool, now time.Time, renew time.Duration) []Candidate {
 	var out []Candidate
 	for _, c := range cands {
-		if c.Addr.IsValid() && !l.Trained(c.Addr) && eligible(c.Addr) {
+		if c.Addr.IsValid() && !l.Fresh(c.Addr, now, renew) && eligible(c.Addr) {
 			out = append(out, c)
 		}
 	}
@@ -124,9 +149,11 @@ func (l *Learner) Select(cands []Candidate, n int, eligible func(netip.Addr) boo
 }
 
 // Decide turns the medians of one destination into a record. baseline is
-// the tunnel it takes without a learned entry; healthy reports which
-// tunnels may still be learned.
-func (l *Learner) Decide(c Candidate, rtt map[string]time.Duration, baseline string, healthy func(string) bool, p *config.Learning, now time.Time) *Record {
+// the tunnel it takes without a learned entry, current the tunnel it is
+// learned for ("" for none, e.g. not measured before). A faster tunnel
+// replaces the current one (or the baseline) only by min_gain, so a
+// renewal does not move a destination for a small difference.
+func (l *Learner) Decide(c Candidate, rtt map[string]time.Duration, baseline, current string, healthy func(string) bool, p *config.Learning, now time.Time) *Record {
 	r := &Record{
 		Addr: c.Addr, Baseline: baseline, RTT: map[string]health.Millis{},
 		Decided: now, Expires: now.Add(p.TTL.D()),
@@ -140,21 +167,41 @@ func (l *Learner) Decide(c Candidate, rtt map[string]time.Duration, baseline str
 		r.Outcome = NoAnswer
 		return r
 	}
-	// The fastest; ties go to the baseline, then by name.
+	// Without an answer from the current tunnel, the baseline is what a
+	// faster one has to beat.
+	cur := current
+	if _, ok := rtt[cur]; !ok {
+		cur = baseline
+	}
+	// The fastest; ties go to the current tunnel, then the baseline, then
+	// by name.
 	slices.Sort(names)
+	rank := func(n string) int {
+		switch n {
+		case cur:
+			return 0
+		case baseline:
+			return 1
+		}
+		return 2
+	}
 	win := names[0]
 	for _, n := range names {
-		if rtt[n] < rtt[win] || (rtt[n] == rtt[win] && n == baseline) {
+		if rtt[n] < rtt[win] || (rtt[n] == rtt[win] && rank(n) < rank(win)) {
 			win = n
 		}
 	}
-	switch base, ok := rtt[baseline]; {
+	chosen := win
+	if old, ok := rtt[cur]; ok && win != cur && (old-rtt[win] < p.MinGain.Abs.D() || float64(old-rtt[win]) < float64(old)*float64(p.MinGain.Rel)) {
+		chosen = cur
+	}
+	switch {
+	case chosen != baseline:
+		r.Tunnel, r.Outcome = chosen, Learned
 	case win == baseline:
 		r.Outcome = Baseline
-	case ok && (base-rtt[win] < p.MinGain.Abs.D() || float64(base-rtt[win]) < float64(base)*float64(p.MinGain.Rel)):
-		r.Outcome = NoGain
 	default:
-		r.Tunnel, r.Outcome = win, Learned
+		r.Outcome = NoGain
 	}
 
 	// Damping: once a destination changed tunnels max_switches times within
