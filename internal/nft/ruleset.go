@@ -6,25 +6,33 @@
 // that chain) rather than mark values.
 //
 // Named counters record how new connections were decided (new, local,
-// excluded, static_<tunnel>, default_<tunnel>) and the upstream packets
-// restored per tunnel (restore_<tunnel>). Apply seeds them with the values
-// of the table it replaces, so they count from the first install rather
-// than from the last change.
+// excluded, static_<tunnel>, learned_<tunnel>, default_<tunnel>) and the
+// upstream packets restored per tunnel (restore_<tunnel>). Apply seeds them
+// with the values of the table it replaces, so they count from the first
+// install rather than from the last change.
+//
+// Learned destinations (design §7) are single addresses with their own
+// timeout. Between table replacements, UpdateLearned adds, renews and
+// removes them as elements, so a learning round never rebuilds the table;
+// the kernel expires them.
 //
 //	table inet tunsel {
 //	  counter new; counter local; counter excluded
-//	  counter static_<tunnel>; counter default_<tunnel>; counter restore_<tunnel>
+//	  counter static_<tunnel>; counter learned_<tunnel>; counter default_<tunnel>; counter restore_<tunnel>
 //	  set ingress   { type ifname; }
 //	  set exclude4  { type ipv4_addr; flags interval; }
 //	  set exclude6  { type ipv6_addr; flags interval; }
 //	  map static4   { type ipv4_addr : verdict; flags interval; }   # goto static_<tunnel>
 //	  map static6   { type ipv6_addr : verdict; flags interval; }
+//	  map learned4  { type ipv4_addr : verdict; flags timeout; }    # goto learned_<tunnel>
+//	  map learned6  { type ipv6_addr : verdict; flags timeout; }
 //
 //	  chain to_<tunnel> {   # one per tunnel
 //	    meta mark set meta mark & ~mask | <mark>
 //	    ct mark set ct mark & ~mask | <mark>
 //	  }
 //	  chain static_<tunnel> { counter name static_<tunnel> goto to_<tunnel> }
+//	  chain learned_<tunnel> { counter name learned_<tunnel> goto to_<tunnel> }
 //	  chain pick4 { counter name default_<tunnel> goto to_<default v4 tunnel> }
 //	  chain pick6 { counter name default_<tunnel> goto to_<default v6 tunnel> }
 //
@@ -34,6 +42,8 @@
 //	    ip6 daddr @exclude6 counter name excluded return
 //	    ip  daddr vmap @static4
 //	    ip6 daddr vmap @static6
+//	    ip  daddr vmap @learned4
+//	    ip6 daddr vmap @learned6
 //	    meta nfproto ipv4 goto pick4
 //	    meta nfproto ipv6 goto pick6
 //	  }
@@ -52,9 +62,11 @@
 package nft
 
 import (
+	"errors"
 	"fmt"
 	"net/netip"
 	"regexp"
+	"time"
 
 	"github.com/google/nftables"
 	"github.com/google/nftables/binaryutil"
@@ -76,8 +88,18 @@ type Ruleset struct {
 	Exclude4, Exclude6 []ranges.Range[struct{}]
 	// Static ranges map to a tunnel name.
 	Static4, Static6 []ranges.Range[string]
+	// Learned destinations; both families.
+	Learned []Learned
 	// Default tunnel per family; "" leaves the family unmarked.
 	Default4, Default6 string
+}
+
+// Learned steers new connections to one address into a tunnel until the
+// timeout runs out.
+type Learned struct {
+	Addr    netip.Addr
+	Tunnel  string
+	Timeout time.Duration
 }
 
 type Tunnel struct {
@@ -93,6 +115,10 @@ func ChainName(tunnel string) string {
 // staticChain returns the name of the chain that counts a tunnel's static
 // matches before applying its mark.
 func staticChain(tunnel string) string { return "static_" + safeName(tunnel) }
+
+// learnedChain returns the name of the chain that counts a tunnel's
+// learned matches before applying its mark.
+func learnedChain(tunnel string) string { return "learned_" + safeName(tunnel) }
 
 func safeName(tunnel string) string { return unsafeChars.ReplaceAllString(tunnel, "_") }
 
@@ -187,6 +213,115 @@ func (m *Manager) Defaults(table string) (v4, v6 string, err error) {
 	return v4, v6, err
 }
 
+// UpdateLearned removes and adds learned destinations of the installed
+// table in one transaction, so a destination being renewed or moved to
+// another tunnel is never without its element. Each removal names the
+// tunnel the element points to now; it is first added again, which is a
+// no-op while it exists and keeps the deletion from failing when the
+// kernel has just expired it. An address must not have a live element for
+// another tunnel than the one a removal names.
+func (m *Manager) UpdateLearned(table string, remove, add []Learned) error {
+	known := map[string]bool{}
+	for _, l := range append(append([]Learned{}, remove...), add...) {
+		known[l.Tunnel] = true
+	}
+	ensure := make([]Learned, len(remove))
+	for i, l := range remove {
+		ensure[i] = Learned{Addr: l.Addr, Tunnel: l.Tunnel, Timeout: time.Second}
+	}
+	if err := checkLearned(ensure, known); err != nil {
+		return err
+	}
+	if err := checkLearned(add, known); err != nil {
+		return err
+	}
+	c, err := nftables.New(append([]nftables.ConnOption{nftables.WithSockOptions(largeBuffers)}, m.Opts...)...)
+	if err != nil {
+		return err
+	}
+	t := &nftables.Table{Family: nftables.TableFamilyINet, Name: table}
+	l4, l6 := learnedSets(t)
+	r4, r6 := learnedElems(ensure)
+	a4, a6 := learnedElems(add)
+	for _, op := range []struct {
+		do    func(*nftables.Set, []nftables.SetElement) error
+		set   *nftables.Set
+		elems []nftables.SetElement
+	}{
+		{c.SetAddElements, l4, r4}, {c.SetAddElements, l6, r6},
+		{c.SetDeleteElements, l4, r4}, {c.SetDeleteElements, l6, r6},
+		{c.SetAddElements, l4, a4}, {c.SetAddElements, l6, a6},
+	} {
+		for rest := op.elems; len(rest) > 0; {
+			n := min(len(rest), elemChunk)
+			if err := op.do(op.set, rest[:n]); err != nil {
+				return fmt.Errorf("set %s: %w", op.set.Name, err)
+			}
+			rest = rest[n:]
+		}
+	}
+	if err := c.Flush(); err != nil {
+		return fmt.Errorf("nft transaction: %w", err)
+	}
+	return nil
+}
+
+// Learned returns the live learned destinations of the installed table,
+// with their remaining time as Timeout, for the given tunnels; elements of
+// other tunnels are skipped. A missing table or map has none.
+func (m *Manager) Learned(table string, tunnels []string) ([]Learned, error) {
+	ok, err := m.Exists(table)
+	if err != nil || !ok {
+		return nil, err
+	}
+	c, err := nftables.New(append([]nftables.ConnOption{nftables.WithSockOptions(largeBuffers)}, m.Opts...)...)
+	if err != nil {
+		return nil, err
+	}
+	byChain := map[string]string{}
+	for _, t := range tunnels {
+		byChain[learnedChain(t)] = t
+	}
+	t := &nftables.Table{Family: nftables.TableFamilyINet, Name: table}
+	var out []Learned
+	for _, name := range []string{"learned4", "learned6"} {
+		set, err := c.GetSetByName(t, name)
+		if errors.Is(err, unix.ENOENT) {
+			continue // a table from a version without learning
+		}
+		if err != nil {
+			return nil, fmt.Errorf("set %s: %w", name, err)
+		}
+		elems, err := c.GetSetElements(set)
+		if err != nil {
+			return nil, fmt.Errorf("set %s: %w", name, err)
+		}
+		for _, e := range elems {
+			a, ok := netip.AddrFromSlice(e.Key)
+			tun := byChain[verdictChain(e.Val)]
+			if ok && tun != "" && e.Expires >= time.Second {
+				out = append(out, Learned{Addr: a, Tunnel: tun, Timeout: e.Expires})
+			}
+		}
+	}
+	return out, nil
+}
+
+// verdictChain returns the chain of an encoded goto or jump verdict
+// (NFTA_VERDICT_CODE, NFTA_VERDICT_CHAIN), or "".
+func verdictChain(b []byte) string {
+	ad, err := netlink.NewAttributeDecoder(b)
+	if err != nil {
+		return ""
+	}
+	for ad.Next() {
+		if ad.Type() == unix.NFTA_VERDICT_CHAIN {
+			return ad.String()
+		}
+	}
+	return ""
+}
+
 // Delete removes the table if it exists.
 func (m *Manager) Delete(table string) error {
 	ok, err := m.Exists(table)
@@ -225,6 +360,24 @@ func (rs *Ruleset) check() error {
 			return fmt.Errorf("static range %s-%s: unknown tunnel %q", r.From, r.To, r.Value)
 		}
 	}
+	return checkLearned(rs.Learned, known)
+}
+
+func checkLearned(ls []Learned, known map[string]bool) error {
+	seen := map[netip.Addr]bool{}
+	for _, l := range ls {
+		switch {
+		case !known[l.Tunnel]:
+			return fmt.Errorf("learned %s: unknown tunnel %q", l.Addr, l.Tunnel)
+		case !l.Addr.IsValid() || l.Addr.Is4In6() || l.Addr.Zone() != "":
+			return fmt.Errorf("learned %s: invalid address", l.Addr)
+		case l.Timeout < time.Second:
+			return fmt.Errorf("learned %s: timeout %s below 1s", l.Addr, l.Timeout)
+		case seen[l.Addr]:
+			return fmt.Errorf("learned %s: listed twice", l.Addr)
+		}
+		seen[l.Addr] = true
+	}
 	return nil
 }
 
@@ -250,7 +403,7 @@ type builder struct {
 }
 
 type sets struct {
-	ingress, exclude4, exclude6, static4, static6 *nftables.Set
+	ingress, exclude4, exclude6, static4, static6, learned4, learned6 *nftables.Set
 }
 
 func (b *builder) chain(name string) *nftables.Chain {
@@ -274,9 +427,13 @@ func (b *builder) tunnelChains() {
 			&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4, Mask: notMask, Xor: ne32(tun.Mark)},
 			&expr.Ct{Key: expr.CtKeyMARK, SourceRegister: true, Register: 1})
 	}
-	// Static map elements jump here, so matches are counted per tunnel.
+	// Static and learned map elements jump here, so matches are counted
+	// per tunnel.
 	for _, tun := range b.rs.Tunnels {
 		b.rule(b.chain(staticChain(tun.Name)), count(StaticCounter(tun.Name)), gotoTunnel(tun.Name))
+	}
+	for _, tun := range b.rs.Tunnels {
+		b.rule(b.chain(learnedChain(tun.Name)), count(LearnedCounter(tun.Name)), gotoTunnel(tun.Name))
 	}
 }
 
@@ -289,6 +446,8 @@ func (b *builder) addSets() (sets, error) {
 		static4:  &nftables.Set{Table: t, Name: "static4", KeyType: nftables.TypeIPAddr, DataType: nftables.TypeVerdict, IsMap: true, Interval: true},
 		static6:  &nftables.Set{Table: t, Name: "static6", KeyType: nftables.TypeIP6Addr, DataType: nftables.TypeVerdict, IsMap: true, Interval: true},
 	}
+	s.learned4, s.learned6 = learnedSets(t)
+	l4, l6 := learnedElems(rs.Learned)
 	var ifs []nftables.SetElement
 	for _, n := range rs.Ingress {
 		ifs = append(ifs, nftables.SetElement{Key: ifname(n)})
@@ -302,12 +461,35 @@ func (b *builder) addSets() (sets, error) {
 		{s.exclude6, intervals(rs.Exclude6, nil)},
 		{s.static4, intervals(rs.Static4, gotoStatic)},
 		{s.static6, intervals(rs.Static6, gotoStatic)},
+		{s.learned4, l4},
+		{s.learned6, l6},
 	} {
 		if err := addSet(b.c, e.set, e.elems); err != nil {
 			return sets{}, fmt.Errorf("set %s: %w", e.set.Name, err)
 		}
 	}
 	return s, nil
+}
+
+func learnedSets(t *nftables.Table) (v4, v6 *nftables.Set) {
+	return &nftables.Set{Table: t, Name: "learned4", KeyType: nftables.TypeIPAddr, DataType: nftables.TypeVerdict, IsMap: true, HasTimeout: true},
+		&nftables.Set{Table: t, Name: "learned6", KeyType: nftables.TypeIP6Addr, DataType: nftables.TypeVerdict, IsMap: true, HasTimeout: true}
+}
+
+// learnedElems returns the map elements of ls per family.
+func learnedElems(ls []Learned) (v4, v6 []nftables.SetElement) {
+	for _, l := range ls {
+		e := nftables.SetElement{
+			Key: l.Addr.AsSlice(), Timeout: l.Timeout.Truncate(time.Millisecond),
+			VerdictData: &expr.Verdict{Kind: expr.VerdictGoto, Chain: learnedChain(l.Tunnel)},
+		}
+		if l.Addr.Is4() {
+			v4 = append(v4, e)
+		} else {
+			v6 = append(v6, e)
+		}
+	}
+	return v4, v6
 }
 
 // decideChain adds the chain that picks a tunnel for a new connection.
@@ -340,6 +522,12 @@ func (b *builder) decideChain(s sets) *nftables.Chain {
 		&expr.Lookup{SourceRegister: 1, DestRegister: 0, IsDestRegSet: true, SetName: s.static4.Name, SetID: s.static4.ID})...)
 	b.rule(decide, append(daddr(unix.NFPROTO_IPV6),
 		&expr.Lookup{SourceRegister: 1, DestRegister: 0, IsDestRegSet: true, SetName: s.static6.Name, SetID: s.static6.ID})...)
+	// Static preferences win: learning measures latency, a static
+	// preference may encode something else (e.g. the exit's location).
+	b.rule(decide, append(daddr(unix.NFPROTO_IPV4),
+		&expr.Lookup{SourceRegister: 1, DestRegister: 0, IsDestRegSet: true, SetName: s.learned4.Name, SetID: s.learned4.ID})...)
+	b.rule(decide, append(daddr(unix.NFPROTO_IPV6),
+		&expr.Lookup{SourceRegister: 1, DestRegister: 0, IsDestRegSet: true, SetName: s.learned6.Name, SetID: s.learned6.ID})...)
 	b.rule(decide, append(nfproto(unix.NFPROTO_IPV4), &expr.Verdict{Kind: expr.VerdictGoto, Chain: pick4.Name})...)
 	b.rule(decide, append(nfproto(unix.NFPROTO_IPV6), &expr.Verdict{Kind: expr.VerdictGoto, Chain: pick6.Name})...)
 	return decide

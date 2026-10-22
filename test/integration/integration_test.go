@@ -33,6 +33,7 @@ const (
 	nsLAN, nsRtr, nsA, nsB, nsWAN = "ts-lan", "ts-rtr", "ts-pa", "ts-pb", "ts-wan"
 
 	dstDefault = "198.18.0.1"
+	dstLearn   = "198.18.0.2" // provider B does not answer TCP 443 for it
 	dstStatic  = "203.0.113.10"
 	dstV6      = "2001:db8::1"
 	dstExclude = "10.0.0.5"
@@ -130,7 +131,7 @@ func topology(t *testing.T) {
 			ip addr add fd98:%[1]d::2/64 dev uplink nodad
 			ip route add 10.99.0.0/24 via 10.98.%[1]d.1
 			ip -6 route add fd99::/64 via fd98:%[1]d::1
-			for a in 192.0.2.1 198.51.100.1 %[2]s %[3]s %[5]s; do ip addr add $a/32 dev lo; done
+			for a in 192.0.2.1 198.51.100.1 %[2]s %[3]s %[5]s %[6]s; do ip addr add $a/32 dev lo; done
 			ip addr add %[4]s/128 dev lo nodad
 			nft -f - <<'EOF'
 			table inet c {
@@ -143,7 +144,7 @@ func topology(t *testing.T) {
 				chain in { type filter hook input priority 0; }
 			}
 EOF
-		`, n, dstDefault, dstStatic, dstV6, dstExclude)))
+		`, n, dstDefault, dstStatic, dstV6, dstExclude, dstLearn)))
 	}
 }
 
@@ -210,32 +211,43 @@ status: { socket: %s }
 
 type daemon struct {
 	cmd    *exec.Cmd
+	bin    string
+	tmpl   string // with %s for default_order and the socket
 	cfg    string
 	socket string
 	log    *bytes.Buffer
 }
 
 func start(t *testing.T, bin string) *daemon {
+	return startWith(t, bin, configTmpl)
+}
+
+func startWith(t *testing.T, bin, tmpl string) *daemon {
 	dir := t.TempDir()
-	d := &daemon{cfg: filepath.Join(dir, "config.yaml"), socket: filepath.Join(dir, "run", "tunsel.sock"), log: &bytes.Buffer{}}
+	d := &daemon{bin: bin, tmpl: tmpl, cfg: filepath.Join(dir, "config.yaml"), socket: filepath.Join(dir, "run", "tunsel.sock"), log: &bytes.Buffer{}}
 	d.write(t, "wg-b, wg-a")
-	d.cmd = exec.Command("ip", "netns", "exec", nsRtr, bin, "run", "-config", d.cfg)
+	d.run(t)
+	return d
+}
+
+func (d *daemon) run(t *testing.T) {
+	d.cmd = exec.Command("ip", "netns", "exec", nsRtr, d.bin, "run", "-config", d.cfg)
 	d.cmd.Stdout, d.cmd.Stderr = d.log, d.log
 	if err := d.cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
+	cmd := d.cmd
 	t.Cleanup(func() {
-		d.cmd.Process.Kill()
-		d.cmd.Wait()
-		if t.Failed() {
+		cmd.Process.Kill()
+		cmd.Wait()
+		if t.Failed() && cmd == d.cmd {
 			t.Logf("daemon log:\n%s", d.log)
 		}
 	})
-	return d
 }
 
 func (d *daemon) write(t *testing.T, order string) {
-	if err := os.WriteFile(d.cfg, []byte(fmt.Sprintf(configTmpl, order, d.socket)), 0o600); err != nil {
+	if err := os.WriteFile(d.cfg, []byte(fmt.Sprintf(d.tmpl, order, d.socket)), 0o600); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -433,4 +445,123 @@ func TestEndToEnd(t *testing.T) {
 			t.Errorf("table left behind with cleanup_on_exit: %s", out)
 		}
 	})
+}
+
+const learnTmpl = `
+nft: { table: tunsel, mark_mask: 0xf }
+tunnels:
+  - name: wg-a
+    mark: 0x1
+    health: { targets: [192.0.2.1], interval: 300ms, timeout: 200ms, fail_after: 2, recover_after: 2 }
+  - name: wg-b
+    mark: 0x2
+    health: { targets: [198.51.100.1], interval: 300ms, timeout: 200ms, fail_after: 2, recover_after: 2 }
+default_order: [%s]
+ingress: { interfaces: [lan0] }
+learning:
+  enabled: true
+  candidates: { refresh: 1s }
+  probe: { timeout: 500ms }
+  ttl: 6s # renewed from 2s before expiry while the flow is in conntrack
+log: { level: debug }
+status: { socket: %s }
+`
+
+// Learning from conntrack: of two destinations the LAN talks to via the
+// default wg-b, one only wg-a answers on TCP 443; it is learned for wg-a
+// and its next connection goes there. The other, which both answer alike,
+// stays on the default. While in use, the learned entry is renewed before
+// it expires; a restart keeps it.
+func TestLearning(t *testing.T) {
+	topology(t)
+	bin := filepath.Join(t.TempDir(), "tunsel")
+	if out, err := exec.Command("go", "build", "-o", bin, "../../cmd/tunsel").CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, out)
+	}
+	sh(t, nsB, "nft add rule inet c in ip daddr "+dstLearn+" tcp dport 443 drop")
+
+	d := startWith(t, bin, learnTmpl)
+	eventually(t, "both tunnels healthy", func() bool { return d.state("wg-a") == "healthy" && d.state("wg-b") == "healthy" })
+	learned := func() map[string]string {
+		r, err := status.Fetch(d.socket, status.Request{Learned: true})
+		if err != nil || r.Learning == nil {
+			return nil
+		}
+		out := map[string]string{}
+		for _, e := range r.Learning.Entries {
+			out[e.Addr.String()] = e.Outcome + ":" + e.Tunnel
+		}
+		return out
+	}
+
+	// The flows that make both destinations candidates, via the default.
+	for _, dst := range []string{dstLearn, dstDefault} {
+		if got := via(t, nsLAN, ping(dst)); got != "wg-b" {
+			t.Fatalf("%s via %s before learning, want wg-b", dst, got)
+		}
+	}
+	eventually(t, "both destinations measured", func() bool { return len(learned()) == 2 })
+	if got := learned(); got[dstLearn] != "learned:wg-a" || !strings.HasPrefix(got[dstDefault], "baseline:") && !strings.HasPrefix(got[dstDefault], "no gain:") {
+		t.Fatalf("measured: %v", got)
+	}
+	// A new ping is a new connection (another ICMP id).
+	if got := via(t, nsLAN, ping(dstLearn)); got != "wg-a" {
+		t.Errorf("learned destination via %s, want wg-a", got)
+	}
+	if got := via(t, nsLAN, ping(dstDefault)); got != "wg-b" {
+		t.Errorf("default destination via %s, want wg-b", got)
+	}
+	if r := d.report(t); r.Tunnels[0].Learned < 1 || r.Learning.Learned != 1 || r.Learning.LastError != "" {
+		t.Errorf("report: wg-a learned %d, %+v", r.Tunnels[0].Learned, r.Learning)
+	}
+	if !strings.Contains(sh(t, nsRtr, "nft list map inet tunsel learned4"), dstLearn+" timeout 6s") {
+		t.Error("learned element missing")
+	}
+
+	// Renewed in place: still there after its first lifetime, and new
+	// connections never fell back to the default meanwhile.
+	first := expires(t, d, dstLearn)
+	for end := time.Now().Add(8 * time.Second); time.Now().Before(end); time.Sleep(time.Second) {
+		if got := via(t, nsLAN, "ping -n -q -c 1 -W 1 "+dstLearn); got != "wg-a" {
+			t.Fatalf("learned destination via %s while being renewed", got)
+		}
+	}
+	if again := expires(t, d, dstLearn); !again.After(first.Add(time.Second)) {
+		t.Errorf("not renewed: expiry %s, first %s", again, first)
+	}
+	if r := d.report(t); r.Learning.Renewals == 0 && !strings.Contains(d.log.String(), "msg=renewed") {
+		t.Errorf("no renewal reported: %+v", r.Learning)
+	}
+
+	// A restart adopts the installed entry instead of forgetting it.
+	d.cmd.Process.Signal(syscall.SIGTERM)
+	if err := d.cmd.Wait(); err != nil {
+		t.Fatalf("exit: %v", err)
+	}
+	d.run(t)
+	eventually(t, "daemon back", func() bool { return d.state("wg-a") == "healthy" && d.state("wg-b") == "healthy" })
+	if got := learned(); got[dstLearn] != "learned:wg-a" {
+		t.Errorf("after restart: %v", got)
+	}
+	if got := via(t, nsLAN, ping(dstLearn)); got != "wg-a" {
+		t.Errorf("learned destination via %s after restart, want wg-a", got)
+	}
+	if !strings.Contains(d.log.String(), "adopted learned destinations") {
+		t.Error("adoption not logged")
+	}
+}
+
+func expires(t *testing.T, d *daemon, addr string) time.Time {
+	t.Helper()
+	r, err := status.Fetch(d.socket, status.Request{Learned: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range r.Learning.Entries {
+		if e.Addr.String() == addr {
+			return e.Expires
+		}
+	}
+	t.Fatalf("%s not measured", addr)
+	return time.Time{}
 }

@@ -10,12 +10,14 @@
 
 // Reads the daemon's report through the rpcd plugin (ubus object "tunsel",
 // which runs `tunsel status -json`). Flows are polled with the report; the
-// RTT history, which changes once per probe interval, less often. Without
+// RTT history and the learned destinations, which change once per probe
+// interval or learning round, less often. Without
 // reject, a failed ubus call (plugin missing, timeout, denied) resolves to
 // the expect default {} instead of an error.
 
 const callFlows = rpc.declare({ object: 'tunsel', method: 'flows', expect: { '': {} }, reject: true });
 const callHistory = rpc.declare({ object: 'tunsel', method: 'history', expect: { '': {} }, reject: true });
+const callLearned = rpc.declare({ object: 'tunsel', method: 'learned', expect: { '': {} }, reject: true });
 
 const SVGNS = 'http://www.w3.org/2000/svg';
 // Counts from here on are shown in magnitude only (IPv6 /64s); JSON
@@ -23,6 +25,8 @@ const SVGNS = 'http://www.w3.org/2000/svg';
 const EXACT_BELOW = 10 ** 12;
 // Polls between history refreshes (every 30 s at 5 s per poll).
 const HISTORY_EVERY = 6;
+// Learned destinations listed, most recent first.
+const LEARNED_SHOWN = 50;
 
 const stateColors = new Map([ [ 'healthy', '#2e9d4f' ], [ 'unhealthy', '#d23f31' ] ]);
 
@@ -60,7 +64,15 @@ function count(n) {
 }
 
 function since(iso) {
-	const s = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000));
+	return span((Date.now() - new Date(iso).getTime()) / 1000);
+}
+
+function until(iso) {
+	return span((new Date(iso).getTime() - Date.now()) / 1000);
+}
+
+function span(seconds) {
+	const s = Math.max(0, Math.round(seconds));
 	if (s < 120) return _('%d s').format(s);
 	if (s < 7200) return _('%d min').format(Math.round(s / 60));
 	if (s < 172800) return _('%d h').format(Math.round(s / 3600));
@@ -143,7 +155,11 @@ function tunnelRow(r, groups, t) {
 		stateCell(r, t),
 		lines((t.latency ?? []).map((l) =>
 			_('%s: %s (avg %s, jitter %s), %s%% lost').format(l.target, ms(l.last_ms), ms(l.avg_ms), ms(l.jitter_ms), l.loss_pct))),
-		lines([ _('%s static').format(count(t.connections_static)), _('%s default').format(count(t.connections_default)) ]),
+		lines([
+			_('%s static').format(count(t.connections_static)),
+			...(r.learning ? [ _('%s learned').format(count(t.connections_learned)) ] : []),
+			_('%s default').format(count(t.connections_default))
+		]),
 		r.flows ? lines([ _('%s flows').format(count(f.flows)), _('%s destinations').format(count(f.destinations)) ]) : '–',
 		lines([
 			r.flows ? _('%s out / %s in').format(bytes(f.bytes_out), bytes(f.bytes_in)) : '',
@@ -162,6 +178,8 @@ function summary(r) {
 		[ _('New connections'), _('%s (excluded %s, local %s, unmarked %s)').format(count(c.new), count(c.excluded), count(c.local), count(c.unmarked)) ],
 		[ _('Excluded prefixes'), ranges(r.exclude) ]
 	];
+	if (r.learning)
+		rows.push([ _('Latency learning'), learningSummary(r.learning) ]);
 	if (r.flows)
 		rows.push([ _('Connections without a tunnel mark'), count(r.flows.other) ]);
 	if (r.last_apply?.error)
@@ -169,6 +187,35 @@ function summary(r) {
 	for (const w of r.warnings ?? [])
 		rows.push([ _('Warning'), w ]);
 	return table([ _('Overview'), '' ], rows);
+}
+
+function learningSummary(l) {
+	const out = [ _('%s every %s; %s destinations learned, %s kept on their baseline').format(l.source, l.refresh, count(l.learned), count(l.kept)) ];
+	out.push(l.last_round && !l.last_round.startsWith('0001-')
+		? _('last round %s ago: %s seen, %s measured (%s renewals)').format(since(l.last_round), count(l.seen), count(l.measured), count(l.renewals))
+		: _('no round yet'));
+	if (l.last_error)
+		out.push(E('strong', {}, [ text(_('failed: %s').format(l.last_error)) ]));
+	return lines(out);
+}
+
+function learnedSection(learned) {
+	if (!learned?.learning)
+		return E('div');
+	const entries = learned.learning.entries ?? [];
+	const rows = entries.slice(0, LEARNED_SHOWN).map((e) => [
+		e.addr,
+		e.tunnel ? E('strong', {}, [ text(e.tunnel) ]) : '–',
+		e.baseline || '–',
+		e.outcome,
+		lines(Object.entries(e.rtt_ms ?? {}).sort(([ a ], [ b ]) => a.localeCompare(b)).map(([ n, v ]) => `${n}: ${ms(v)}`)),
+		_('in %s').format(until(e.expires))
+	]);
+	return E('div', { 'class': 'cbi-section' }, [
+		E('h3', {}, [ text(_('Learned destinations')) ]),
+		E('p', { 'class': 'cbi-section-descr' }, [ text(_('Most recent first (%d of %d). A destination without a tunnel keeps its baseline, the static preference or default it takes anyway.').format(rows.length, entries.length)) ]),
+		rows.length ? table([ _('Destination'), _('Tunnel'), _('Baseline'), _('Outcome'), _('Handshake (median)'), _('Expires') ], rows) : E('em', {}, [ text(_('Nothing measured yet.')) ])
+	]);
 }
 
 function latencySection(history) {
@@ -205,7 +252,7 @@ function topSection(r) {
 	]);
 }
 
-function report(r, history) {
+function report(r, history, learned) {
 	if (r.error)
 		return E('div', { 'class': 'alert-message warning' }, [
 			E('p', {}, [ text(_('tunsel is not running or not reachable:')) ]),
@@ -220,6 +267,7 @@ function report(r, history) {
 			table([ _('Tunnel'), _('State'), _('Latency'), _('New connections'), _('Active flows'), _('Traffic'), _('Static preferences') ],
 				(r.tunnels ?? []).map((t) => tunnelRow(r, groups, t)))
 		]),
+		learnedSection(learned),
 		latencySection(history),
 		topSection(r)
 	]);
@@ -230,27 +278,34 @@ function fetchFlows() {
 }
 
 return view.extend({
-	load: () => Promise.all([ fetchFlows(), L.resolveDefault(callHistory(), {}) ]),
+	load: () => Promise.all([ fetchFlows(), L.resolveDefault(callHistory(), {}), L.resolveDefault(callLearned(), {}) ]),
 
-	render: ([ first, firstHistory ]) => {
+	render: ([ first, firstHistory, firstLearned ]) => {
 		const node = E('div');
 		let history = firstHistory;
+		let learned = firstLearned;
+		let learning = !!first.learning;
 		let polls = 0;
-		dom.content(node, report(first, history));
+		dom.content(node, report(first, history, learned));
 
 		poll.add(() => {
 			polls++;
-			// The history only gains one sample per probe interval.
-			const nextHistory = polls % HISTORY_EVERY === 0 ? L.resolveDefault(callHistory(), history) : Promise.resolve(history);
-			return Promise.all([ fetchFlows(), nextHistory ]).then(([ r, h ]) => {
+			// The history only gains one sample per probe interval, the
+			// learned destinations change once per learning round.
+			const slow = polls % HISTORY_EVERY === 0;
+			const nextHistory = slow ? L.resolveDefault(callHistory(), history) : Promise.resolve(history);
+			const nextLearned = slow && learning ? L.resolveDefault(callLearned(), learned) : Promise.resolve(learned);
+			return Promise.all([ fetchFlows(), nextHistory, nextLearned ]).then(([ r, h, l ]) => {
 				history = h;
-				dom.content(node, report(r, history));
+				learned = l;
+				learning = !!r.learning;
+				dom.content(node, report(r, history, learned));
 			});
 		}, 5);
 
 		return E('div', {}, [
 			E('h2', {}, [ text(_('Tunsel')) ]),
-			E('p', { 'class': 'cbi-map-descr' }, [ text(_('Health, latency and traffic of the steered tunnels. Counters run since the nftables table was created, normally since boot.')) ]),
+			E('p', { 'class': 'cbi-map-descr' }, [ text(_('Health, latency, learned destinations and traffic of the steered tunnels. Counters run since the nftables table was created, normally since boot.')) ]),
 			node
 		]);
 	},

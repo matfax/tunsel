@@ -18,6 +18,9 @@ const (
 // StaticCounter counts new connections steered by a static preference.
 func StaticCounter(tunnel string) string { return "static_" + safeName(tunnel) }
 
+// LearnedCounter counts new connections steered by a learned destination.
+func LearnedCounter(tunnel string) string { return "learned_" + safeName(tunnel) }
+
 // DefaultCounter counts new connections steered as the family's default.
 func DefaultCounter(tunnel string) string { return "default_" + safeName(tunnel) }
 
@@ -35,7 +38,7 @@ type Counter struct {
 func (b *builder) counters(seed map[string]Counter) {
 	names := []string{CounterNew, CounterLocal, CounterExcluded}
 	for _, t := range b.rs.Tunnels {
-		names = append(names, StaticCounter(t.Name), DefaultCounter(t.Name), RestoreCounter(t.Name))
+		names = append(names, StaticCounter(t.Name), LearnedCounter(t.Name), DefaultCounter(t.Name), RestoreCounter(t.Name))
 	}
 	for _, n := range names {
 		v := seed[n]

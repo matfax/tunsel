@@ -1,4 +1,5 @@
-// Command tunsel steers new connections between VPN tunnels by health.
+// Command tunsel steers new connections between VPN tunnels by health and,
+// per destination, by measured latency.
 package main
 
 import (
@@ -23,7 +24,7 @@ const usage = `usage: tunsel <command> [flags]
 commands:
   run      run the daemon (-config path)
   check    validate a configuration file (-config path)
-  status   show daemon state (-socket path, -json, -flows, -history)
+  status   show daemon state (-socket path, -json, -flows, -history, -learned)
   version  print the version
 
 A configuration file whose name ends in .yaml or .yml is YAML; any other
@@ -95,6 +96,7 @@ func showStatus(args []string) error {
 	var req status.Request
 	fs.BoolVar(&req.Flows, "flows", false, "include the conntrack flows per tunnel")
 	fs.BoolVar(&req.History, "history", false, "include the RTT history per health target")
+	fs.BoolVar(&req.Learned, "learned", false, "include the measured destinations and their tunnels")
 	fs.Parse(args)
 	r, err := status.Fetch(*socket, req)
 	if err != nil {

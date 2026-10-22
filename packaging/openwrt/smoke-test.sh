@@ -118,6 +118,8 @@ i=0; until ubus list tunsel >/dev/null 2>&1; do i=$((i+1)); [ $i -lt 10 ] || fai
 ubus call tunsel status | grep -q '"connections"' || fail "ubus tunsel status"
 ubus call tunsel flows | grep -q '"flows"' || fail "ubus tunsel flows"
 ubus call tunsel history | grep -q '"history"' || fail "ubus tunsel history"
+# Learning is off in the shipped config, so this only checks the method.
+ubus call tunsel learned | grep -q '"connections"' || fail "ubus tunsel learned"
 [ -f /www/luci-static/resources/view/tunsel/status.js ] || fail "views not installed"
 
 echo "- upgrade: restarted, still enabled, config kept"

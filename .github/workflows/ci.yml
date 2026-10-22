@@ -29,6 +29,11 @@ jobs:
         with:
           go-version-file: go.mod   # caches modules and build cache, keyed on go.sum
       - uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+        with:
+          # An exact version skips the action's release lookup, which fails
+          # whenever the GitHub API answers without 3.x releases (Renovate
+          # updates it, see renovate.json).
+          version: 3.54.0
       - name: vet and unit tests
         run: task test 2>&1 | tee unit.log
       - name: integration tests (root, network namespaces)
@@ -135,6 +140,8 @@ jobs:
         with:
           go-version-file: go.mod
       - uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+        with:
+          version: 3.54.0 # exact, see the test job
       - name: build packages
         env:
           VERSION: ${{ inputs.version }}

@@ -131,3 +131,34 @@ func TestCover(t *testing.T) {
 		t.Errorf("::/0 should saturate: %d", s.IPv6)
 	}
 }
+
+// Route mirrors the ruleset: the most specific static preference of a
+// healthy tunnel, else the default of the family.
+func TestRoute(t *testing.T) {
+	cfg, err := config.Parse([]byte(cfgYAML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := Defaults{V4: "wg-b", V6: "wg-a"}
+	for _, tc := range []struct {
+		addr    string
+		healthy []string
+		tunnel  string
+		static  bool
+	}{
+		{"203.0.113.200", []string{"wg-a", "wg-c"}, "wg-c", true},
+		{"203.0.113.200", []string{"wg-a"}, "wg-a", true},
+		{"203.0.113.200", nil, "wg-b", false},
+		{"198.18.0.1", []string{"wg-a", "wg-c"}, "wg-b", false},
+		{"2001:db8:100::1", []string{"wg-c"}, "wg-c", true},
+		{"2001:db8:200::1", []string{"wg-c"}, "wg-a", false},
+	} {
+		tun, static := Route(cfg, healthy(tc.healthy...), d, netip.MustParseAddr(tc.addr))
+		if tun != tc.tunnel || static != tc.static {
+			t.Errorf("%s with %v healthy: %s %v, want %s %v", tc.addr, tc.healthy, tun, static, tc.tunnel, tc.static)
+		}
+	}
+	if !Excluded(cfg, netip.MustParseAddr("10.1.2.3")) || Excluded(cfg, netip.MustParseAddr("198.18.0.1")) {
+		t.Error("Excluded")
+	}
+}

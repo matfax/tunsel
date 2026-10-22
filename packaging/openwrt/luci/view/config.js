@@ -36,6 +36,12 @@ function duration(_sid, value) {
 	return _('Expecting a duration, e.g. 10s or 500ms');
 }
 
+function percent(_sid, value) {
+	if (value === '' || /^\d+\.?\d*%$/.test(value))
+		return true;
+	return _('Expecting a percentage, e.g. 15%');
+}
+
 function probe(_sid, value) {
 	if (value === '' || value === 'icmp' || /^tcp:\d+$/.test(value))
 		return true;
@@ -47,7 +53,7 @@ function generalOptions(s) {
 	o.rmempty = false;
 
 	o = s.taboption('general', form.DynamicList, 'default_order', _('Default order'),
-		_('Tunnel interfaces; the first healthy one carries traffic without a static preference.'));
+		_('Tunnel interfaces; the first healthy one carries traffic without a static preference or a learned tunnel.'));
 	for (const t of uci.sections('tunsel', 'tunnel'))
 		if (t.iface)
 			o.value(t.iface);
@@ -97,6 +103,39 @@ function advancedOptions(s) {
 		_('Changes take effect after a restart.'));
 	o.placeholder = '/run/tunsel/tunsel.sock';
 	o.datatype = 'string';
+}
+
+// Per-destination learning (design §7).
+function learningOptions(s) {
+	const value = (name, title, description, placeholder, check) => {
+		const o = s.taboption('learning', form.Value, name, title, description);
+		o.placeholder = placeholder;
+		if (typeof check === 'function')
+			o.validate = check;
+		else
+			o.datatype = check;
+		return o;
+	};
+	const count = 'and(uinteger,min(1))';
+
+	s.taboption('learning', form.Flag, 'learning', _('Enabled'),
+		_('Measure the busiest destinations through every healthy tunnel and steer each to the fastest. Static preferences still win.'));
+
+	value('learn_top_n', _('Destinations per refresh'),
+		_('The current connections are ranked by bytes per destination; the busiest that have no measurement yet are measured.'), '100', count);
+	value('learn_refresh', _('Refresh interval'), null, '5m', duration);
+	value('learn_port', _('Probe port'),
+		_('TCP handshake time to this port via each healthy tunnel.'), '443', 'port');
+	value('learn_samples', _('Samples'), _('Handshakes per tunnel; the median counts.'), '3', count);
+	value('learn_timeout', _('Probe timeout'), null, '2s', duration);
+	value('learn_min_gain_abs', _('Minimum gain'),
+		_('A tunnel replaces the default only if it is faster by this much…'), '5ms', duration);
+	value('learn_min_gain_rel', _('Minimum relative gain'), _('…and by this share.'), '15%', percent);
+	value('learn_ttl', _('Lifetime'),
+		_('How long a measurement is kept. A destination still in use is measured again from two refresh intervals before it expires, and its tunnel renewed or changed without a gap.'), '1h', duration);
+	value('learn_damp_window', _('Damping window'), null, '30m', duration);
+	value('learn_damp_max_switches', _('Switches per window'),
+		_('At most this many tunnel changes per destination within the damping window.'), '2', count);
 }
 
 function tunnelGeneralOptions(s) {
@@ -164,14 +203,16 @@ return view.extend({
 
 	render: () => {
 		const m = new form.Map('tunsel', _('Tunsel'),
-			_('Health-aware selection between VPN tunnels. Per tunnel, the router must provide a routing table with a default route via the tunnel and a rule "fwmark MARK/MASK lookup TABLE". Unmarked traffic falls through to normal routing.'));
+			_('Health-aware selection between VPN tunnels, optionally the fastest per destination. Per tunnel, the router must provide a routing table with a default route via the tunnel and a rule "fwmark MARK/MASK lookup TABLE". Unmarked traffic falls through to normal routing.'));
 
 		const main = m.section(form.NamedSection, 'main', 'tunsel', _('General'));
 		main.addremove = false;
 		main.tab('general', _('General'));
 		main.tab('advanced', _('Advanced'));
+		main.tab('learning', _('Latency learning'));
 		generalOptions(main);
 		advancedOptions(main);
+		learningOptions(main);
 
 		const tunnels = m.section(form.GridSection, 'tunnel', _('Tunnels'));
 		tunnels.addremove = true;

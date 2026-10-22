@@ -47,6 +47,26 @@ default_order: [wg-b, wg-a]
 ingress: { interfaces: [lan0] }
 `
 
+var oneTunnel = strings.Replace(strings.Replace(base, `  - name: wg-b
+    mark: 0x2
+    families: [ipv4]
+    health: { targets: [198.51.100.1] }
+`, "", 1), "[wg-b, wg-a]", "[wg-a]", 1)
+
+// Learning is accepted with two tunnels.
+func TestLearningConfig(t *testing.T) {
+	if _, err := Parse([]byte(oneTunnel)); err != nil {
+		t.Fatalf("one tunnel without learning: %v", err)
+	}
+	c, err := Parse([]byte(base + "learning: { enabled: true }\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l := c.Learning; !l.Enabled || l.Candidates.Source != "conntrack" || l.Candidates.Refresh.D() != 5*time.Minute {
+		t.Errorf("learning: %+v", l)
+	}
+}
+
 func TestDefaults(t *testing.T) {
 	c, err := Parse([]byte(base))
 	if err != nil {
@@ -64,6 +84,11 @@ func TestDefaults(t *testing.T) {
 	}
 	if c.Status.Socket != DefaultSocket {
 		t.Errorf("socket: %s", c.Status.Socket)
+	}
+	l := c.Learning
+	if l.Candidates.Source != "conntrack" || l.Candidates.TopN != 100 || l.Probe.Port != 443 || l.Probe.Samples != 3 ||
+		l.MinGain.Rel != 0.15 || l.TTL.D() != time.Hour || l.FlapDamp.MaxSwitches != 2 {
+		t.Errorf("learning defaults: %+v", l)
 	}
 }
 
@@ -84,7 +109,11 @@ func TestInvalid(t *testing.T) {
 		{"probe", strings.Replace(base, `"tcp:443"`, "udp", 1), "expected icmp or tcp"},
 		{"ingress tunnel", strings.Replace(base, "[lan0]", "[wg-a]", 1), "is a tunnel"},
 		{"chain name collision", strings.Replace(base, "name: wg-b", "name: wg.a", 1), "same nft chain"},
-		{"learning", base + "learning: { enabled: true }\n", "not implemented"},
+		{"learning one tunnel", oneTunnel + "learning: { enabled: true }\n", "needs at least two tunnels"},
+		{"learning source", base + "learning: { candidates: { source: dns } }\n", `source "dns": expected conntrack`},
+		{"learning top_n", base + "learning: { candidates: { top_n: -1 } }\n", "top_n: must be at least 1"},
+		{"learning ttl", base + "learning: { ttl: -1h }\n", "learning.ttl: must be positive"},
+		{"learning percent", base + "learning: { min_gain: { rel: 15 } }\n", `invalid percentage "15"`},
 		{"duration", strings.Replace(base, `probe: "tcp:443"`, "interval: soon", 1), "invalid duration"},
 	}
 	for _, tc := range cases {

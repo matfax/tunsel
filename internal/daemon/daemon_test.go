@@ -24,6 +24,11 @@ type fakeTables struct {
 	failTable string
 	v4, v6    string // installed defaults (chain names)
 	counters  map[string]nft.Counter
+	added     [][]nft.Learned // UpdateLearned calls: additions
+	removed   [][]nft.Learned // and removals
+	installed []nft.Learned   // Learned answers
+	failAdd   bool
+	rejectAdd netip.Addr // fails any batch containing it
 }
 
 func (f *fakeTables) Apply(rs *nft.Ruleset, _ ...string) error {
@@ -44,6 +49,34 @@ func (f *fakeTables) Counters(string) (map[string]nft.Counter, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.counters, nil
+}
+func (f *fakeTables) UpdateLearned(_ string, remove, ls []nft.Learned) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failAdd {
+		return errors.New("no such table")
+	}
+	for _, l := range append(append([]nft.Learned{}, remove...), ls...) {
+		if l.Addr == f.rejectAdd {
+			return errors.New("file exists")
+		}
+	}
+	f.added = append(f.added, ls)
+	f.removed = append(f.removed, remove)
+	return nil
+}
+func (f *fakeTables) Learned(string, []string) ([]nft.Learned, error) {
+	return f.installed, nil
+}
+func (f *fakeTables) removes() [][]nft.Learned {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([][]nft.Learned(nil), f.removed...)
+}
+func (f *fakeTables) adds() [][]nft.Learned {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([][]nft.Learned(nil), f.added...)
 }
 func (f *fakeTables) last() *nft.Ruleset {
 	f.mu.Lock()

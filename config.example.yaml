@@ -32,7 +32,7 @@ tunnels:
       fail_after: 3
       recover_after: 3
 
-# First healthy tunnel wins for traffic without a learned/static match.
+# First healthy tunnel wins for traffic without a static or learned match.
 default_order: [wg-b, wg-a]
 
 ingress:
@@ -57,24 +57,27 @@ static_pref:
 conntrack:
   flush_on_unhealthy: true # delete a failed tunnel's flows so they are re-decided
 
-# Phase 2 (not implemented yet; must stay disabled)
+# Per-destination selection by measured latency: the most used destinations
+# are measured through every healthy tunnel (TCP handshake), and each gets
+# the fastest one for ttl. Static preferences still win. Values below are
+# the defaults.
 learning:
   enabled: false
   candidates:
-    source: conntrack
-    top_n: 100
+    source: conntrack      # steered flows, by bytes in both directions
+    top_n: 100             # destinations without a measurement, per refresh
     refresh: 5m
   probe:
-    port: 443
-    samples: 3
+    port: 443              # TCP handshake time via each healthy tunnel
+    samples: 3             # per tunnel; the median counts
     timeout: 2s
-  min_gain:
+  min_gain:                # beat the default by both, or keep it
     abs: 5ms
     rel: 15%
-  ttl: 1h
+  ttl: 1h                  # lifetime; renewed from 2 refreshes before, if in use
   flap_damping:
-    window: 30m
-    max_switches: 2
+    window: 30m            # at most max_switches changes per destination
+    max_switches: 2        # within window
 
 log:
   level: info              # debug | info | warn | error

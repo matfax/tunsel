@@ -6,6 +6,19 @@
     "docker:pinDigests"
   ],
   "postUpdateOptions": ["gomodTidy"],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "The Task version pinned for go-task/setup-task in the workflows",
+      "managerFilePatterns": ["/^\\.github/workflows/[^/]+\\.ya?ml$/"],
+      "matchStrings": [
+        "go-task/setup-task@\\S+[^\\n]*\\n\\s+with:\\n(?:\\s+#[^\\n]*\\n)*\\s+version: (?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "go-task/task",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>.+)$"
+    }
+  ],
   "packageRules": [
     {
       "description": "Merge non-major updates automatically once all required checks pass",
