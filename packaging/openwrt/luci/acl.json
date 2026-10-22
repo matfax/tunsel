@@ -3,7 +3,7 @@
 		"description": "Grant access to tunsel status and configuration",
 		"read": {
 			"ubus": {
-				"tunsel": [ "status", "flows", "history" ]
+				"tunsel": [ "status", "flows", "history", "learned" ]
 			},
 			"uci": [ "tunsel" ]
 		},

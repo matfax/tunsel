@@ -128,7 +128,10 @@ func TestUCIHealthOptions(t *testing.T) {
 func TestUCILearningOptions(t *testing.T) {
 	c, err := ParseUCI([]byte(strings.Replace(uciBase, "list ingress 'lan0'", `list ingress 'lan0'
 	option learning '0'
-	option learn_source 'conntrack'
+	option learn_source 'adguard'
+	option learn_adguard_url 'http://127.0.0.1:3000'
+	option learn_adguard_username 'admin'
+	option learn_adguard_password 'secret'
 	option learn_top_n '50'
 	option learn_refresh '10m'
 	option learn_port '8443'
@@ -143,11 +146,12 @@ func TestUCILearningOptions(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := Learning{
-		Candidates: Candidates{Source: "conntrack", TopN: 50, Refresh: Duration(10 * time.Minute)},
-		Probe:      LearnProbe{Port: 8443, Samples: 5, Timeout: Duration(time.Second)},
-		MinGain:    MinGain{Abs: Duration(10 * time.Millisecond), Rel: 0.2},
-		TTL:        Duration(2 * time.Hour),
-		FlapDamp:   FlapDamping{Window: Duration(time.Hour), MaxSwitches: 3},
+		Candidates: Candidates{Source: "adguard", TopN: 50, Refresh: Duration(10 * time.Minute),
+			AdGuard: AdGuard{URL: "http://127.0.0.1:3000", Username: "admin", Password: "secret"}},
+		Probe:    LearnProbe{Port: 8443, Samples: 5, Timeout: Duration(time.Second)},
+		MinGain:  MinGain{Abs: Duration(10 * time.Millisecond), Rel: 0.2},
+		TTL:      Duration(2 * time.Hour),
+		FlapDamp: FlapDamping{Window: Duration(time.Hour), MaxSwitches: 3},
 	}
 	if !reflect.DeepEqual(c.Learning, want) {
 		t.Errorf("learning:\n got %+v\nwant %+v", c.Learning, want)

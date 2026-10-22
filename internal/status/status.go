@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"github.com/matfax/tunsel/internal/engine"
 	"github.com/matfax/tunsel/internal/flows"
 	"github.com/matfax/tunsel/internal/health"
+	"github.com/matfax/tunsel/internal/learn"
 	"github.com/matfax/tunsel/internal/nft"
 )
 
@@ -35,6 +37,8 @@ type Report struct {
 	// installed (nft counters, kept across table replacements).
 	Connections Connections       `json:"connections"`
 	Exclude     engine.RangeStats `json:"exclude"`
+	// Only while learning is enabled.
+	Learning *Learning `json:"learning,omitempty"`
 	// Only on request.
 	Flows *Flows `json:"flows,omitempty"`
 	// Counters or flows that could not be read.
@@ -45,8 +49,10 @@ type Tunnel struct {
 	Name string `json:"name"`
 	Mark uint32 `json:"mark"`
 	health.Snapshot
-	// New connections steered here by a static preference or as default.
+	// New connections steered here by a static preference, a learned
+	// destination or as default.
 	Static  uint64 `json:"connections_static"`
+	Learned uint64 `json:"connections_learned"`
 	Default uint64 `json:"connections_default"`
 	// Upstream packets of established connections sent into the tunnel.
 	// Flows offloaded to a flowtable are not counted.
@@ -65,6 +71,24 @@ type Connections struct {
 	Unmarked uint64 `json:"unmarked"`
 }
 
+// Learning summarizes per-destination learning (design §7).
+type Learning struct {
+	Source    string    `json:"source"`
+	Refresh   string    `json:"refresh"`
+	LastRound time.Time `json:"last_round"`
+	LastError string    `json:"last_error,omitempty"`
+	// Of the last round: candidates the source reported, and those
+	// measured (untrained and eligible, at most top_n).
+	Seen     int `json:"seen"`
+	Measured int `json:"measured"`
+	// Live records: with a learned tunnel in nft, and without one (the
+	// baseline was fastest, the gain too small, no answer or damped).
+	Learned int `json:"learned"`
+	Kept    int `json:"kept"`
+	// Only on request, most recent first.
+	Entries []learn.Record `json:"entries,omitempty"`
+}
+
 // Flows is the current conntrack table attributed to tunnels.
 type Flows struct {
 	At      time.Time              `json:"at"`
@@ -78,10 +102,12 @@ type Apply struct {
 }
 
 // Request selects the optional parts of a report. On the socket it is one
-// line: "status", optionally followed by "flows" and/or "history".
+// line: "status", optionally followed by "flows", "history" and/or
+// "learned".
 type Request struct {
 	Flows   bool
 	History bool
+	Learned bool
 }
 
 func (r Request) String() string {
@@ -91,6 +117,9 @@ func (r Request) String() string {
 	}
 	if r.History {
 		s += " history"
+	}
+	if r.Learned {
+		s += " learned"
 	}
 	return s
 }
@@ -107,6 +136,8 @@ func parseRequest(line string) (Request, error) {
 			r.Flows = true
 		case "history":
 			r.History = true
+		case "learned":
+			r.Learned = true
 		default:
 			return Request{}, fmt.Errorf("unknown option %q", w)
 		}
@@ -191,7 +222,8 @@ func Fetch(path string, req Request) (*Report, error) {
 }
 
 // Render writes the report as text: a header, then one section each for
-// health, latency, traffic and, when requested, flows and RTT history.
+// health, latency, traffic and, when requested, flows, learned
+// destinations and RTT history.
 func (r *Report) Render(w io.Writer) {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	r.renderHeader(w)
@@ -199,6 +231,7 @@ func (r *Report) Render(w io.Writer) {
 	r.renderLatency(w, tw)
 	r.renderTraffic(w, tw)
 	r.renderFlows(w, tw)
+	r.renderLearned(w, tw)
 	r.renderHistory(w)
 }
 
@@ -213,6 +246,16 @@ func (r *Report) renderHeader(w io.Writer) {
 	}
 	c := r.Connections
 	fmt.Fprintf(w, "new connections: %d (excluded %d, local %d, unmarked %d)\n", c.New, c.Excluded, c.Local, c.Unmarked)
+	if l := r.Learning; l != nil {
+		last := "no round yet"
+		if !l.LastRound.IsZero() {
+			last = fmt.Sprintf("last round %s ago: %d seen, %d measured", time.Since(l.LastRound).Round(time.Second), l.Seen, l.Measured)
+		}
+		fmt.Fprintf(w, "learning: %s every %s, %s; %d destinations learned, %d kept on their baseline\n", l.Source, l.Refresh, last, l.Learned, l.Kept)
+		if l.LastError != "" {
+			fmt.Fprintf(w, "learning FAILED: %s\n", l.LastError)
+		}
+	}
 }
 
 func (r *Report) renderHealth(w io.Writer, tw *tabwriter.Writer) {
@@ -248,9 +291,9 @@ func (r *Report) renderLatency(w io.Writer, tw *tabwriter.Writer) {
 
 func (r *Report) renderTraffic(w io.Writer, tw *tabwriter.Writer) {
 	fmt.Fprintln(w)
-	fmt.Fprintln(tw, "TUNNEL\tSTATIC\tDEFAULT\tUPSTREAM\tSTATIC RANGES")
+	fmt.Fprintln(tw, "TUNNEL\tSTATIC\tLEARNED\tDEFAULT\tUPSTREAM\tSTATIC RANGES")
 	for _, t := range r.Tunnels {
-		fmt.Fprintf(tw, "%s\t%d\t%d\t%s, %d pkts\t%s\n", t.Name, t.Static, t.Default,
+		fmt.Fprintf(tw, "%s\t%d\t%d\t%d\t%s, %d pkts\t%s\n", t.Name, t.Static, t.Learned, t.Default,
 			fmtBytes(t.Upstream.Bytes), t.Upstream.Packets, fmtRanges(t.Ranges))
 	}
 	tw.Flush()
@@ -274,6 +317,40 @@ func (r *Report) renderFlows(w io.Writer, tw *tabwriter.Writer) {
 			fmtBytes(g.BytesOut), fmtBytes(g.BytesIn), strings.Join(top, ", "))
 	}
 	tw.Flush()
+}
+
+// LearnedShown bounds the learned destinations listed as text; -json has
+// all of them.
+const LearnedShown = 50
+
+func (r *Report) renderLearned(w io.Writer, tw *tabwriter.Writer) {
+	if r.Learning == nil || r.Learning.Entries == nil {
+		return
+	}
+	es := r.Learning.Entries
+	fmt.Fprintf(w, "\nlearned destinations, most recent first (%d of %d)\n", min(len(es), LearnedShown), len(es))
+	fmt.Fprintln(tw, "DESTINATION\tNAME\tTUNNEL\tBASELINE\tOUTCOME\tHANDSHAKE\tEXPIRES IN")
+	for _, e := range es[:min(len(es), LearnedShown)] {
+		names := make([]string, 0, len(e.RTT))
+		for n := range e.RTT {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		var rtts []string
+		for _, n := range names {
+			rtts = append(rtts, n+" "+millis(e.RTT[n]))
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", e.Addr, orDash(e.Name), orDash(e.Tunnel), orDash(e.Baseline), e.Outcome,
+			orDash(strings.Join(rtts, ", ")), time.Until(e.Expires).Round(time.Second))
+	}
+	tw.Flush()
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }
 
 func (r *Report) renderHistory(w io.Writer) {

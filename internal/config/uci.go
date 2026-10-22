@@ -432,6 +432,12 @@ func (r uciReader) learning(o uciOption, l *Learning) bool {
 		r.setString(o, &l.Candidates.Source)
 	case "learn_top_n":
 		r.setInt(o, &l.Candidates.TopN)
+	case "learn_adguard_url":
+		r.setString(o, &l.Candidates.AdGuard.URL)
+	case "learn_adguard_username":
+		r.setString(o, &l.Candidates.AdGuard.Username)
+	case "learn_adguard_password":
+		r.setString(o, &l.Candidates.AdGuard.Password)
 	case "learn_refresh":
 		r.setDuration(o, &l.Candidates.Refresh)
 	case "learn_port":

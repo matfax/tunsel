@@ -6,7 +6,7 @@ All site specifics live in a config file; the repository contains no environment
 ## 1. Purpose
 
 - **Failover:** when a tunnel stops passing traffic, new connections move to the next healthy tunnel; when it recovers, they move back.
-- **Per-destination selection (phase 2):** for frequently used destinations, measure which tunnel is faster and prefer it for a limited time.
+- **Per-destination selection (learning, §7):** for frequently used destinations, measure which tunnel is faster and prefer it for a limited time. Destinations come from AdGuard Home's query log (before the first connection) or from conntrack.
 - **Static preferences:** route configured prefixes via a preferred tunnel (e.g. a provider's own ranges via that provider's tunnel), subject to health.
 
 ## 2. Non-goals
@@ -56,7 +56,7 @@ table inet tunsel {
   counter new { packets 0 bytes 0 }                             # named counters, see 4.4
   counter local { ... }
   counter excluded { ... }
-  counter static_wg_a { ... }                                   # static_, default_, restore_ per tunnel
+  counter static_wg_a { ... }                                   # static_, learned_, default_, restore_ per tunnel
   ...
 
   set ingress  { type ifname; }
@@ -64,6 +64,8 @@ table inet tunsel {
   set exclude6 { type ipv6_addr; flags interval; }
   map static4  { type ipv4_addr : verdict; flags interval; }    # effective static prefs → goto static_<tunnel>
   map static6  { type ipv6_addr : verdict; flags interval; }
+  map learned4 { type ipv4_addr : verdict; flags timeout; }     # learned destinations (§7) → goto learned_<tunnel>
+  map learned6 { type ipv6_addr : verdict; flags timeout; }     # e.g. 198.18.0.2 timeout 1h expires 59m : goto learned_wg_a
 
   chain to_wg_a {                                               # one per tunnel
     meta mark set meta mark & 0xfffffff1 | 0x00000001           # i.e. & ~mask | mark
@@ -73,6 +75,8 @@ table inet tunsel {
 
   chain static_wg_a { counter name "static_wg_a" goto to_wg_a } # one per tunnel
   chain static_wg_b { ... }
+  chain learned_wg_a { counter name "learned_wg_a" goto to_wg_a } # one per tunnel
+  chain learned_wg_b { ... }
 
   chain pick4 { counter name "default_wg_b" goto to_wg_b }      # current defaults
   chain pick6 { counter name "default_wg_a" goto to_wg_a }
@@ -85,6 +89,8 @@ table inet tunsel {
     ip6 daddr @exclude6 counter name "excluded" return
     ip daddr vmap @static4                                      # no entry → next rule
     ip6 daddr vmap @static6
+    ip daddr vmap @learned4                                     # static preferences win over learning
+    ip6 daddr vmap @learned6
     meta nfproto ipv4 goto pick4
     meta nfproto ipv6 goto pick6
   }
@@ -108,7 +114,6 @@ table inet tunsel {
 }
 ```
 
-Phase 2 adds `learned4`/`learned6` (`type ipv4_addr : verdict; flags timeout`), looked up in `decide` before the static maps.
 
 ### 4.3 Materialized state
 
@@ -118,18 +123,20 @@ The daemon owns the *effective* contents of `static*`, `learned*` and `pick4`/`p
 - `learned*` never contains entries for unhealthy tunnels. Each entry carries its own nft timeout (`ttl`), so the kernel expires it even when the daemon is not running.
 - `pick4`/`pick6` point at the first healthy tunnel in `default_order` that carries the family (`families`, default both). If none is healthy, the last value is kept (traffic fails closed via the firewall, never leaks). With no previous value (cold start, nothing healthy) the chain is empty and traffic stays unmarked.
 
-Every health or config change replaces the whole table in one nft transaction (delete + create), so there is never a partially updated state; conntrack marks of existing connections are unaffected. Learning results are the exception: they are added to and removed from `learned*` as single elements, so a refresh does not rebuild the table. The daemon keeps its own copy of the learned entries with their expiry and never reads them back from nft; a full replacement re-adds the entries of healthy tunnels with their remaining timeout. The daemon re-checks every 15 s that its table exists and re-applies it if another tool removed it.
+Every health or config change replaces the whole table in one nft transaction (delete + create), so there is never a partially updated state; conntrack marks of existing connections are unaffected. Learning results are the exception: they are added to `learned*` as single elements and expired by the kernel, so a refresh does not rebuild the table. The daemon keeps its own copy of the learned entries with their expiry; a full replacement re-adds the entries of healthy tunnels with their remaining timeout. It reads them back from nft only at start, to adopt the entries of a previous run. nft rejects an element for an address that already has one for another tunnel, which would fail the whole transaction, so a failed batch is retried one element at a time. The daemon re-checks every 15 s that its table exists and re-applies it if another tool removed it.
 
 ### 4.4 Counters
 
-Named counters attribute new connections to the decision taken: `new` counts every new connection entering `decide`, and exactly one of `local`, `excluded`, `static_<tunnel>` or `default_<tunnel>` counts its outcome; the difference is the connections left unmarked (no default for the family). `restore_<tunnel>` counts the upstream packets and bytes of established connections. Each apply reads the counters of the table it replaces and creates the new ones with those values, so they count from the table's first install (normally boot, or until `cleanup_on_exit`), not from the last change. Packets of flows offloaded to a flowtable skip the hook, so `restore_*` undercounts with flow offloading; the per-decision counts are unaffected, since the first packets of a connection are never offloaded.
+Named counters attribute new connections to the decision taken: `new` counts every new connection entering `decide`, and exactly one of `local`, `excluded`, `static_<tunnel>`, `learned_<tunnel>` or `default_<tunnel>` counts its outcome; the difference is the connections left unmarked (no default for the family). `restore_<tunnel>` counts the upstream packets and bytes of established connections. Each apply reads the counters of the table it replaces and creates the new ones with those values, so they count from the table's first install (normally boot, or until `cleanup_on_exit`), not from the last change. Packets of flows offloaded to a flowtable skip the hook, so `restore_*` undercounts with flow offloading; the per-decision counts are unaffected, since the first packets of a connection are never offloaded.
 
 ## 5. Decision order (per new connection)
 
 1. Destination is a local, broadcast or multicast address, or in `exclude` → unmarked (host routing).
-2. `learned` entry → that tunnel.
-3. `static_pref` entry → that tunnel.
+2. `static_pref` entry → that tunnel.
+3. `learned` entry → that tunnel.
 4. `pick4`/`pick6` → first healthy tunnel in `default_order` that carries the family.
+
+Static preferences come before learning: learning only measures latency, while a static preference may encode something else (an exit's location, a provider's own ranges). Learning therefore never measures a destination covered by a static preference in effect.
 
 Health filtering is applied when materializing 2–4, so a dead tunnel is never selected.
 
@@ -144,22 +151,35 @@ Health filtering is applied when materializing 2–4, so a dead tunnel is never 
 - Latency: every probe records its round-trip time (ICMP echo to reply; TCP until the handshake completes or is refused). The last 360 probes per target (1 h at the default interval) are kept in memory, with lost probes, including rounds skipped while the link is down; the status reports last, min, avg, max, jitter (mean change between consecutive answers) and loss over that window, and the samples on request. A reload keeps them for unchanged tunnels.
 - Rationale: an "up" WireGuard interface says nothing about whether the peer answers.
 
-## 7. Per-destination learning (phase 2)
+## 7. Per-destination learning
 
-- **Candidates:** every `candidates.refresh`, the top-N (`candidates.top_n`) destinations by bytes from conntrack (ingress-steered flows only) that have **no learned entry**. Ranking happens after filtering, so all N slots go to untrained destinations.
-- **No re-training:** a learned entry is not measured again while it lives. When its `ttl` expires, the destination is untrained again and competes for a slot at the next refresh; until then its new connections take the static preference or the default.
-- **Measurement:** TCP handshake time to `probe.port` via each healthy tunnel (bound sockets), several samples, median.
-- **Decision:** the winner is stored with `ttl` only if it beats the tunnel the destination takes without a learned entry (static preference or default) by `min_gain.abs` **and** `min_gain.rel`. Changes of a destination's tunnel are counted over `flap_damping.window`, across expiries; after `flap_damping.max_switches` the current tunnel is kept until the window has passed.
-- **Caveat:** CDN answers depend on the resolver's location. A measurement compares paths to the *same* IP; it does not account for a different IP the other tunnel's resolver might have returned. Documented limitation, not solved in phase 2.
+Off by default (`learning.enabled`); needs at least two tunnels.
+
+- **Candidates**, every `candidates.refresh`, from one of two sources:
+  - `adguard`: the A and AAAA answers in AdGuard Home's query log (`GET /control/querylog`, HTTP basic auth with `adguard.username`/`password`) since the previous poll; the first poll after start looks back one refresh. Ranked by the number of queries per address. A client usually connects right after its query, so a destination is measured while its first connections still take the default, and later ones get the faster tunnel. Queries from loopback clients (the router itself) count only with `include_local_output`. One poll reads at most 10 000 log entries. Default refresh 1 min.
+  - `conntrack`: the destinations of the current flows that carry a tunnel's mark (steered from an ingress interface), ranked by bytes in both directions, then by flows. A destination becomes a candidate only once it has traffic. Default refresh 5 min.
+- **Selection:** the top `candidates.top_n` candidates that have **no record** (below) and are eligible: a public unicast address, not in `exclude`, not covered by a static preference in effect, and carried by at least two healthy tunnels. Ranking happens after filtering, so all slots go to unmeasured destinations.
+- **Measurement:** the TCP handshake time to `probe.port` through each eligible tunnel, from sockets bound to the tunnel device with its mark (as in §6; a RST counts), `probe.samples` times with all tunnels of a sample in parallel, and the median per tunnel. Up to 16 destinations are measured at once, without holding up health transitions. Probes carry the tunnel's mark but no conntrack mark, so they never become conntrack candidates themselves.
+- **Decision:** against the *baseline*, the tunnel the destination takes without a learned entry (the default of its family), as of the end of the measurement:
+  - the fastest tunnel is the baseline (ties go to the baseline): `baseline`;
+  - it beats the baseline by less than `min_gain.abs` or less than `min_gain.rel` of the baseline's time: `no gain`;
+  - otherwise, or if the baseline did not answer: `learned`, and the faster tunnel is installed in `learned*` with timeout `ttl`;
+  - no tunnel answered: `no answer` (e.g. nothing listens on the port).
+- **Records:** every outcome is kept for `ttl`, so a destination is not measured again before then, whatever the outcome; when it expires (plus 2 s, so the kernel has dropped the element), the destination competes for a slot again. Until then its new connections take the default.
+- **Damping:** the effective tunnel of a destination (learned, or its baseline) is remembered across expiries. Once it changed `flap_damping.max_switches` times within `flap_damping.window`, it stays on the tunnel it has until the window has passed (`damped`).
+- **Health and reloads:** when a tunnel becomes unhealthy, its learned entries are removed with the table replacement and their destinations measured again. Records without a learned tunnel are dropped when their baseline changes (e.g. the default switched). Disabling learning forgets everything. A restart adopts the entries of the installed table with their remaining time. An AdGuard source keeps its position in the query log across reloads that leave `candidates` unchanged.
+- **Caveat:** CDN answers depend on the resolver's location. A measurement compares paths to the *same* IP; it does not account for a different IP the other tunnel's resolver might have returned.
 - **Caveat:** ICMP is not used for learning (often deprioritized by VPN servers).
+- **Caveat:** the handshake time measures the path to the destination's port 443, not throughput.
 
 ## 8. Failure semantics
 
 | Situation | Behavior |
 |---|---|
-| Daemon not running (boot, crash) | Learned entries expire; last defaults stay; unmarked traffic uses host routing. No leak (firewall). |
-| Daemon (re)starts | The first health round completes before the table is touched, so the previous table stays in effect until a fresh decision is installed. The defaults of an installed table are read back and kept if no tunnel is healthy. Conntrack entries of tunnels found unhealthy are flushed. |
+| Daemon not running (boot, crash) | Learned entries stay until their timeout, then expire; last defaults stay; unmarked traffic uses host routing. No leak (firewall). |
+| Daemon (re)starts | The first health round completes before the table is touched, so the previous table stays in effect until a fresh decision is installed. The defaults of an installed table are read back and kept if no tunnel is healthy, and its learned entries adopted. Conntrack entries of tunnels found unhealthy are flushed. |
 | A tunnel fails | Within `fail_after × interval` (immediately for link down / route missing), new connections avoid it, its learned entries are removed and its conntrack entries are flushed. |
+| AdGuard Home unreachable, or nft rejects learned entries | Logged and shown as the last learning error; the round's other results are kept, the failed ones are measured again next round. |
 | All tunnels fail | No healthy target; last defaults stay; traffic fails closed via the firewall. |
 | Config invalid at start | Daemon refuses to start; existing nft table left untouched. |
 | Config invalid on `SIGHUP`, or its ruleset rejected by nft | Error logged; the daemon keeps running with the previous configuration and its monitors. |
@@ -227,8 +247,8 @@ For OpenWrt and Turris OS, where Docker support is limited. Built without the SD
 - Architectures: opkg names mapped to the three Go targets (`arm_cortex-a*` → `arm/v7`, `aarch64_*` → `arm64`, `x86_64` → `amd64`); `IPK_ARCHS` in `Taskfile.yml` lists the released ones.
 - Depends: `kmod-nft-core`, `kmod-nft-fib`, `kmod-nf-conntrack-netlink` (ctnetlink is not part of a default image).
 - Files: `/usr/sbin/tunsel`, `/etc/init.d/tunsel`, `/etc/config/tunsel`.
-- Config: UCI, `/etc/config/tunsel`, shipped with `enabled 0` and the placeholder tunnels of `config.example.yaml`. It is a conffile: opkg keeps a changed one on upgrade and removal, and sysupgrade keeps it. The schema is flat: one `tunsel` section named `main` with the global options and the `enabled` switch (read by the init script only), and one `tunnel` section per tunnel with the interface as option `iface` (section names cannot hold `-`), the health options folded in and the tunnel's static preferences as list `prefer`. The learning options are flat options of `main` (`learning` for the switch, `learn_top_n`, `learn_refresh`, `learn_port`, `learn_samples`, `learn_timeout`, `learn_min_gain_abs`, `learn_min_gain_rel`, `learn_ttl`, `learn_damp_window`, `learn_damp_max_switches`, `learn_source`); metrics have no UCI options until they are implemented.
-- `luci-app-tunsel` (`Architecture: all`, depends on `tunsel` and `luci-base`): Services → Tunsel in LuCI. The configuration page is a form on the UCI config, including a tab for the learning parameters (without the switch while learning is not implemented); Save & Apply commits it, and the reload trigger reloads the daemon. The status page reads the report through an rpcd exec plugin (`/usr/libexec/rpcd/tunsel`, ubus object `tunsel` with methods `status`, `flows` and `history`, each running `tunsel status -json`), polls it every 5 s and draws the RTT history per target.
+- Config: UCI, `/etc/config/tunsel`, shipped with `enabled 0` and the placeholder tunnels of `config.example.yaml`. It is a conffile: opkg keeps a changed one on upgrade and removal, and sysupgrade keeps it. The schema is flat: one `tunsel` section named `main` with the global options and the `enabled` switch (read by the init script only), and one `tunnel` section per tunnel with the interface as option `iface` (section names cannot hold `-`), the health options folded in and the tunnel's static preferences as list `prefer`. The learning options are flat options of `main` (`learning` for the switch, `learn_source`, `learn_adguard_url`, `learn_adguard_username`, `learn_adguard_password`, `learn_top_n`, `learn_refresh`, `learn_port`, `learn_samples`, `learn_timeout`, `learn_min_gain_abs`, `learn_min_gain_rel`, `learn_ttl`, `learn_damp_window`, `learn_damp_max_switches`); metrics have no UCI options until they are implemented.
+- `luci-app-tunsel` (`Architecture: all`, depends on `tunsel` and `luci-base`): Services → Tunsel in LuCI. The configuration page is a form on the UCI config, with a tab for learning; Save & Apply commits it, and the reload trigger reloads the daemon. The status page reads the report through an rpcd exec plugin (`/usr/libexec/rpcd/tunsel`, ubus object `tunsel` with methods `status`, `flows`, `history` and `learned`, each running `tunsel status -json`), polls it every 5 s, draws the RTT history per target and lists the 50 most recent learned destinations.
 - Version: the tag without `v`; untagged builds are `0~<git describe>`, so they sort below every release.
 
 | Aspect | Behavior |
@@ -244,20 +264,20 @@ For OpenWrt and Turris OS, where Docker support is limited. Built without the SD
 ## 10. Observability
 
 - Structured logs: health transitions, default switches, learned decisions (with measured values).
-- `tunsel status`: health per tunnel (state, since, link, last round, streak, per-target errors), latency per health target (6), current defaults, last apply error; new connections by decision and upstream traffic per tunnel (4.4); per tunnel the static preferences in effect and the address space they cover after flattening and health filtering, and the same for `exclude`. `-flows` adds the current conntrack table attributed to tunnels by mark: entries, distinct destinations, bytes per direction (with `nf_conntrack_acct`, the OpenWrt default) and the top 10 destinations by bytes; dumps are reused for 5 s. `-history` adds the RTT samples. `-json` for scripts. Phase 2 adds top learned entries.
-- The status socket takes a one-line request (`status`, optionally followed by `flows` and/or `history`) and answers with the JSON report.
+- `tunsel status`: health per tunnel (state, since, link, last round, streak, per-target errors), latency per health target (6), current defaults, last apply error; new connections by decision and upstream traffic per tunnel (4.4); per tunnel the static preferences in effect and the address space they cover after flattening and health filtering, and the same for `exclude`. `-flows` adds the current conntrack table attributed to tunnels by mark: entries, distinct destinations, bytes per direction (with `nf_conntrack_acct`, the OpenWrt default) and the top 10 destinations by bytes; dumps are reused for 5 s. `-history` adds the RTT samples. With learning: its source and last round (candidates seen, destinations measured, last error), the live records with and without a learned tunnel, and new connections steered by a learned entry per tunnel; `-learned` adds every record (address, queried name, tunnel, baseline, outcome, median handshake per tunnel, expiry), most recent first, the first 50 as text. `-json` for scripts.
+- The status socket takes a one-line request (`status`, optionally followed by `flows`, `history` and/or `learned`) and answers with the JSON report.
 - Optional metrics endpoint bound to localhost.
 
 ## 11. Phases
 
-1. **MVP (implemented):** config loading, nft table management, health checks with hysteresis, default switching, `exclude`, `static_pref` with health filtering, conntrack flush on failure, status command, container image. `learning.enabled: true` and a non-empty `metrics.listen` are rejected until phases 2 and 3; the learning parameters are already parsed, defaulted and validated (YAML, UCI, LuCI) but unused.
-2. **Learning:** conntrack candidate selection, TCP probing, margins, TTL, damping.
+1. **MVP (implemented):** config loading, nft table management, health checks with hysteresis, default switching, `exclude`, `static_pref` with health filtering, conntrack flush on failure, status command, container image.
+2. **Learning (implemented):** AdGuard Home and conntrack candidates, TCP probing, margins, TTL, damping (§7). A non-empty `metrics.listen` is rejected until phase 3.
 3. **Optional:** dynamic prefix sources for `static_pref` (URL lists with refresh), metrics.
 
 ## 12. Testing
 
-- Unit tests: config validation, prefix flattening, decision logic, hysteresis, monitor rounds.
-- nft tests (root): the ruleset is installed in a throwaway network namespace and compared against `nft list` output.
-- Integration test (root, `-tags integration`): LAN client, router, two veth "tunnels" to provider namespaces and a WAN namespace. Per-provider counters assert the path of: default, static and excluded destinations, local output, failover (probes dropped) including a running flow moved by the conntrack flush, recovery, link down with the policy route lost, reload (valid and invalid) and clean shutdown. IPv6 checks are skipped on hosts booted with `ipv6.disable=1`.
+- Unit tests: config validation, prefix flattening, decision logic, hysteresis, monitor rounds; learning: the AdGuard query log (paging, cursor, auth, loopback clients) against a fake server, conntrack ranking, selection, decisions, damping, medians, and the daemon's rounds, failover, adoption, failed adds and reloads.
+- nft tests (root): the ruleset is installed in a throwaway network namespace and compared against `nft list` output; learned elements are added, read back with their remaining time and dropped by a replacement.
+- Integration test (root, `-tags integration`): LAN client, router, two veth "tunnels" to provider namespaces and a WAN namespace. Per-provider counters assert the path of: default, static and excluded destinations, local output, failover (probes dropped) including a running flow moved by the conntrack flush, recovery, link down with the policy route lost, reload (valid and invalid) and clean shutdown. A second test learns from a query log served in the router's namespace: a destination provider B does not answer on TCP 443 is learned for wg-a and steered there although wg-b is the default, one both answer alike stays on the default, and a restart adopts the learned entry. IPv6 checks are skipped on hosts booted with `ipv6.disable=1`.
 - OpenWrt smoke test (Docker, `packaging/openwrt/smoke-test.sh`): the x86_64 package and `luci-app-tunsel` installed into an OpenWrt rootfs booted with procd, dependencies from the feeds; install (disabled), start (invalid and valid config), reload (explicit and by `reload_config`), disable and enable, the rpcd plugin's methods, upgrade (config kept), stop and removal.
 - CI runs all of the above and builds the multi-arch image and the packages. Releases are cut by the manually run release workflow, which bumps the major, minor or patch part of the latest version, runs the same jobs, pushes and attests the image and leaves a draft release with the packages; publishing the draft creates the `v*` tag.

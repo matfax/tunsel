@@ -53,7 +53,7 @@ function generalOptions(s) {
 	o.rmempty = false;
 
 	o = s.taboption('general', form.DynamicList, 'default_order', _('Default order'),
-		_('Tunnel interfaces; the first healthy one carries traffic without a static preference.'));
+		_('Tunnel interfaces; the first healthy one carries traffic without a static preference or a learned tunnel.'));
 	for (const t of uci.sections('tunsel', 'tunnel'))
 		if (t.iface)
 			o.value(t.iface);
@@ -105,8 +105,7 @@ function advancedOptions(s) {
 	o.datatype = 'string';
 }
 
-// Phase 2 parameters (design §7). The switch itself is left out until
-// learning is implemented; the daemon rejects learning=1.
+// Per-destination learning (design §7).
 function learningOptions(s) {
 	const value = (name, title, description, placeholder, check) => {
 		const o = s.taboption('learning', form.Value, name, title, description);
@@ -119,18 +118,36 @@ function learningOptions(s) {
 	};
 	const count = 'and(uinteger,min(1))';
 
+	s.taboption('learning', form.Flag, 'learning', _('Enabled'),
+		_('Measure the busiest destinations through every healthy tunnel and steer each to the fastest. Static preferences still win.'));
+
+	let o = s.taboption('learning', form.ListValue, 'learn_source', _('Destinations from'));
+	o.value('conntrack', _('Current connections (conntrack, by bytes)'));
+	o.value('adguard', _('AdGuard Home query log (by queries, before the first connection)'));
+	o.default = 'conntrack';
+
+	o = value('learn_adguard_url', _('AdGuard Home URL'),
+		_('Its web interface; the query log must be enabled there.'), 'http://127.0.0.1:3000', 'string');
+	o.depends('learn_source', 'adguard');
+	o.rmempty = false;
+	o = value('learn_adguard_username', _('AdGuard Home user'), null, '', 'string');
+	o.depends('learn_source', 'adguard');
+	o = value('learn_adguard_password', _('AdGuard Home password'), null, '', 'string');
+	o.depends('learn_source', 'adguard');
+	o.password = true;
+
 	value('learn_top_n', _('Destinations per refresh'),
-		_('The busiest destinations by bytes that have no learned tunnel yet are measured.'), '100', count);
-	value('learn_refresh', _('Refresh interval'), null, '5m', duration);
+		_('The most used destinations that have no measurement yet are measured.'), '100', count);
+	value('learn_refresh', _('Refresh interval'), _('Default 1m for AdGuard Home, 5m for conntrack.'), '', duration);
 	value('learn_port', _('Probe port'),
 		_('TCP handshake time to this port via each healthy tunnel.'), '443', 'port');
 	value('learn_samples', _('Samples'), _('Handshakes per tunnel; the median counts.'), '3', count);
 	value('learn_timeout', _('Probe timeout'), null, '2s', duration);
 	value('learn_min_gain_abs', _('Minimum gain'),
-		_('A tunnel replaces the current choice only if it is faster by this much…'), '5ms', duration);
+		_('A tunnel replaces the default only if it is faster by this much…'), '5ms', duration);
 	value('learn_min_gain_rel', _('Minimum relative gain'), _('…and by this share.'), '15%', percent);
 	value('learn_ttl', _('Lifetime'),
-		_('How long a learned tunnel is kept; the destination is measured again only after it expires.'), '1h', duration);
+		_('How long a measurement is kept; the destination is measured again only after it expires.'), '1h', duration);
 	value('learn_damp_window', _('Damping window'), null, '30m', duration);
 	value('learn_damp_max_switches', _('Switches per window'),
 		_('At most this many tunnel changes per destination within the damping window.'), '2', count);
@@ -201,14 +218,13 @@ return view.extend({
 
 	render: () => {
 		const m = new form.Map('tunsel', _('Tunsel'),
-			_('Health-aware selection between VPN tunnels. Per tunnel, the router must provide a routing table with a default route via the tunnel and a rule "fwmark MARK/MASK lookup TABLE". Unmarked traffic falls through to normal routing.'));
+			_('Health-aware selection between VPN tunnels, optionally the fastest per destination. Per tunnel, the router must provide a routing table with a default route via the tunnel and a rule "fwmark MARK/MASK lookup TABLE". Unmarked traffic falls through to normal routing.'));
 
 		const main = m.section(form.NamedSection, 'main', 'tunsel', _('General'));
 		main.addremove = false;
 		main.tab('general', _('General'));
 		main.tab('advanced', _('Advanced'));
-		main.tab('learning', _('Latency learning'),
-			_('Per-destination selection of the fastest tunnel. Not active yet: this version stores these settings but does not learn.'));
+		main.tab('learning', _('Latency learning'));
 		generalOptions(main);
 		advancedOptions(main);
 		learningOptions(main);

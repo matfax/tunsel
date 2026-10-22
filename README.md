@@ -3,8 +3,12 @@
 Health-aware selection between VPN tunnels on a Linux router. New connections
 from the LAN go to the first healthy tunnel in a configured order, with static
 per-prefix preferences; when a tunnel fails, traffic moves to the next one and
-moves back on recovery. tunsel owns one nftables table and nothing else:
-interfaces, routing tables, policy rules and the firewall stay with the host.
+moves back on recovery. Optionally, tunsel learns the fastest tunnel per
+destination: it takes the addresses AdGuard Home resolves (or the busiest
+current connections), times a TCP handshake to port 443 through every healthy
+tunnel, and steers new connections to each destination through the fastest
+one for an hour. tunsel owns one nftables table and nothing else: interfaces,
+routing tables, policy rules and the firewall stay with the host.
 
 See [DESIGN.md](DESIGN.md) for the design, the full ruleset and failure
 semantics, and [config.example.yaml](config.example.yaml) for all options
@@ -50,7 +54,8 @@ Omnia) and `luci-app-tunsel_<version>_all.ipk`. The first installs the
 binary, a procd service, the UCI config `/etc/config/tunsel` (disabled, with
 placeholder tunnels) and the nftables/conntrack kernel modules it needs; the
 second adds Services → Tunsel to LuCI, with a configuration page and a status
-page (health, latency history, connections and flows per tunnel):
+page (health, latency history, connections and flows per tunnel, learned
+destinations):
 
 ```sh
 opkg update && opkg install ./tunsel_<version>_<arch>.ipk ./luci-app-tunsel_<version>_all.ipk
@@ -62,8 +67,21 @@ Configure in LuCI and Save & Apply, or from the shell:
 uci set tunsel.main.enabled=1        # plus your tunnels; see /etc/config/tunsel
 uci commit tunsel
 /etc/init.d/tunsel reload            # validate, then SIGHUP (or start, stop if disabled)
-tunsel status                        # -flows: conntrack per tunnel; -history: RTT history
+tunsel status                        # -flows: conntrack per tunnel; -history: RTT history; -learned: measured destinations
 logread -e tunsel
+```
+
+Latency learning from AdGuard Home (its query log must be enabled; DESIGN.md
+§7 has the details, LuCI the same options under Latency learning):
+
+```sh
+uci set tunsel.main.learning=1
+uci set tunsel.main.learn_source=adguard
+uci set tunsel.main.learn_adguard_url=http://127.0.0.1:3000
+uci set tunsel.main.learn_adguard_username=admin
+uci set tunsel.main.learn_adguard_password='…'
+uci commit tunsel                    # reloads the daemon
+tunsel status -learned               # what was measured and where it goes
 ```
 
 opkg keeps a changed config on upgrade and removal, and sysupgrade keeps it.

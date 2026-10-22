@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/nftables"
 
@@ -82,6 +83,10 @@ const want = `table inet tunsel {
 		packets 0 bytes 0
 	}
 
+	counter learned_wg_a {
+		packets 0 bytes 0
+	}
+
 	counter default_wg_a {
 		packets 0 bytes 0
 	}
@@ -91,6 +96,10 @@ const want = `table inet tunsel {
 	}
 
 	counter static_wg_b {
+		packets 0 bytes 0
+	}
+
+	counter learned_wg_b {
 		packets 0 bytes 0
 	}
 
@@ -132,6 +141,16 @@ const want = `table inet tunsel {
 		elements = { 2001:db8:100::/48 : goto static_wg_a }
 	}
 
+	map learned4 {
+		type ipv4_addr : verdict
+		flags timeout
+	}
+
+	map learned6 {
+		type ipv6_addr : verdict
+		flags timeout
+	}
+
 	chain to_wg_a {
 		meta mark set meta mark & 0xfffffff1 | 0x00000001
 		ct mark set ct mark & 0xfffffff1 | 0x00000001
@@ -150,6 +169,14 @@ const want = `table inet tunsel {
 		counter name "static_wg_b" goto to_wg_b
 	}
 
+	chain learned_wg_a {
+		counter name "learned_wg_a" goto to_wg_a
+	}
+
+	chain learned_wg_b {
+		counter name "learned_wg_b" goto to_wg_b
+	}
+
 	chain pick4 {
 		counter name "default_wg_b" goto to_wg_b
 	}
@@ -166,6 +193,8 @@ const want = `table inet tunsel {
 		ip6 daddr @exclude6 counter name "excluded" return
 		ip daddr vmap @static4
 		ip6 daddr vmap @static6
+		ip daddr vmap @learned4
+		ip6 daddr vmap @learned6
 		meta nfproto ipv4 goto pick4
 		meta nfproto ipv6 goto pick6
 	}
@@ -351,6 +380,70 @@ func TestLargeSets(t *testing.T) {
 	}
 }
 
+// Learned destinations are installed with the table and added as elements
+// later; each keeps its own timeout, and a replacement installs those it
+// is given.
+func TestLearned(t *testing.T) {
+	m, run := netns(t)
+	rs := sample()
+	rs.Learned = []Learned{{netip.MustParseAddr("198.18.0.1"), "wg-a", time.Hour}}
+	if err := m.Apply(rs); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.AddLearned("tunsel", []Learned{
+		{netip.MustParseAddr("198.18.0.2"), "wg-b", 10 * time.Minute},
+		{netip.MustParseAddr("2001:db8:1::1"), "wg-b", time.Minute},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got := run("nft", "list", "map", "inet", "tunsel", "learned4") + run("nft", "list", "map", "inet", "tunsel", "learned6")
+	for _, w := range []string{
+		"198.18.0.1 timeout 1h expires ", ": goto learned_wg_a",
+		"198.18.0.2 timeout 10m expires ", ": goto learned_wg_b",
+		"2001:db8:1::1 timeout 1m expires ",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("learned maps lack %q:\n%s", w, got)
+		}
+	}
+	if err := m.AddLearned("tunsel", []Learned{{netip.MustParseAddr("198.18.0.3"), "nope", time.Hour}}); err == nil {
+		t.Error("unknown tunnel accepted")
+	}
+
+	// Read back for a restart: the remaining time, by tunnel.
+	ls, err := m.Learned("tunsel", []string{"wg-a", "wg-b"})
+	if err != nil || len(ls) != 3 {
+		t.Fatalf("read back: %+v %v", ls, err)
+	}
+	for _, l := range ls {
+		want := map[string]Learned{
+			"198.18.0.1": {Tunnel: "wg-a", Timeout: time.Hour}, "198.18.0.2": {Tunnel: "wg-b", Timeout: 10 * time.Minute},
+			"2001:db8:1::1": {Tunnel: "wg-b", Timeout: time.Minute},
+		}[l.Addr.String()]
+		if l.Tunnel != want.Tunnel || l.Timeout > want.Timeout || l.Timeout < want.Timeout-time.Minute/2 {
+			t.Errorf("read back %+v, want %+v", l, want)
+		}
+	}
+	if ls, err := m.Learned("tunsel", []string{"wg-b"}); err != nil || len(ls) != 2 {
+		t.Errorf("only wg-b: %+v %v", ls, err)
+	}
+	if ls, err := m.Learned("missing", nil); err != nil || ls != nil {
+		t.Errorf("missing table: %+v %v", ls, err)
+	}
+	run("nft", "add", "table", "inet", "old") // as left by a version without learning
+	if ls, err := m.Learned("old", []string{"wg-a"}); err != nil || ls != nil {
+		t.Errorf("table without learned maps: %+v %v", ls, err)
+	}
+
+	rs.Learned = rs.Learned[:0]
+	if err := m.Apply(rs); err != nil {
+		t.Fatal(err)
+	}
+	if got := run("nft", "list", "map", "inet", "tunsel", "learned4"); strings.Contains(got, "198.18") {
+		t.Errorf("replacement kept elements:\n%s", got)
+	}
+}
+
 func TestCheck(t *testing.T) {
 	rs := sample()
 	rs.Tunnels = append(rs.Tunnels, Tunnel{"wg.a", 0x3})
@@ -361,5 +454,18 @@ func TestCheck(t *testing.T) {
 	rs.Default4 = "nope"
 	if err := rs.check(); err == nil {
 		t.Error("unknown default accepted")
+	}
+	a := netip.MustParseAddr("198.18.0.1")
+	for _, l := range [][]Learned{
+		{{a, "nope", time.Hour}},
+		{{a, "wg-a", time.Millisecond}},
+		{{a, "wg-a", time.Hour}, {a, "wg-b", time.Hour}},
+		{{netip.MustParseAddr("::ffff:198.18.0.1"), "wg-a", time.Hour}},
+	} {
+		rs = sample()
+		rs.Learned = l
+		if err := rs.check(); err == nil {
+			t.Errorf("learned %v accepted", l)
+		}
 	}
 }

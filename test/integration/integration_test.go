@@ -33,6 +33,7 @@ const (
 	nsLAN, nsRtr, nsA, nsB, nsWAN = "ts-lan", "ts-rtr", "ts-pa", "ts-pb", "ts-wan"
 
 	dstDefault = "198.18.0.1"
+	dstLearn   = "198.18.0.2" // provider B does not answer TCP 443 for it
 	dstStatic  = "203.0.113.10"
 	dstV6      = "2001:db8::1"
 	dstExclude = "10.0.0.5"
@@ -130,7 +131,7 @@ func topology(t *testing.T) {
 			ip addr add fd98:%[1]d::2/64 dev uplink nodad
 			ip route add 10.99.0.0/24 via 10.98.%[1]d.1
 			ip -6 route add fd99::/64 via fd98:%[1]d::1
-			for a in 192.0.2.1 198.51.100.1 %[2]s %[3]s %[5]s; do ip addr add $a/32 dev lo; done
+			for a in 192.0.2.1 198.51.100.1 %[2]s %[3]s %[5]s %[6]s; do ip addr add $a/32 dev lo; done
 			ip addr add %[4]s/128 dev lo nodad
 			nft -f - <<'EOF'
 			table inet c {
@@ -143,7 +144,7 @@ func topology(t *testing.T) {
 				chain in { type filter hook input priority 0; }
 			}
 EOF
-		`, n, dstDefault, dstStatic, dstV6, dstExclude)))
+		`, n, dstDefault, dstStatic, dstV6, dstExclude, dstLearn)))
 	}
 }
 
@@ -210,32 +211,43 @@ status: { socket: %s }
 
 type daemon struct {
 	cmd    *exec.Cmd
+	bin    string
+	tmpl   string // with %s for default_order and the socket
 	cfg    string
 	socket string
 	log    *bytes.Buffer
 }
 
 func start(t *testing.T, bin string) *daemon {
+	return startWith(t, bin, configTmpl)
+}
+
+func startWith(t *testing.T, bin, tmpl string) *daemon {
 	dir := t.TempDir()
-	d := &daemon{cfg: filepath.Join(dir, "config.yaml"), socket: filepath.Join(dir, "run", "tunsel.sock"), log: &bytes.Buffer{}}
+	d := &daemon{bin: bin, tmpl: tmpl, cfg: filepath.Join(dir, "config.yaml"), socket: filepath.Join(dir, "run", "tunsel.sock"), log: &bytes.Buffer{}}
 	d.write(t, "wg-b, wg-a")
-	d.cmd = exec.Command("ip", "netns", "exec", nsRtr, bin, "run", "-config", d.cfg)
+	d.run(t)
+	return d
+}
+
+func (d *daemon) run(t *testing.T) {
+	d.cmd = exec.Command("ip", "netns", "exec", nsRtr, d.bin, "run", "-config", d.cfg)
 	d.cmd.Stdout, d.cmd.Stderr = d.log, d.log
 	if err := d.cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
+	cmd := d.cmd
 	t.Cleanup(func() {
-		d.cmd.Process.Kill()
-		d.cmd.Wait()
-		if t.Failed() {
+		cmd.Process.Kill()
+		cmd.Wait()
+		if t.Failed() && cmd == d.cmd {
 			t.Logf("daemon log:\n%s", d.log)
 		}
 	})
-	return d
 }
 
 func (d *daemon) write(t *testing.T, order string) {
-	if err := os.WriteFile(d.cfg, []byte(fmt.Sprintf(configTmpl, order, d.socket)), 0o600); err != nil {
+	if err := os.WriteFile(d.cfg, []byte(fmt.Sprintf(d.tmpl, order, d.socket)), 0o600); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -433,4 +445,100 @@ func TestEndToEnd(t *testing.T) {
 			t.Errorf("table left behind with cleanup_on_exit: %s", out)
 		}
 	})
+}
+
+const learnTmpl = `
+nft: { table: tunsel, mark_mask: 0xf }
+tunnels:
+  - name: wg-a
+    mark: 0x1
+    health: { targets: [192.0.2.1], interval: 300ms, timeout: 200ms, fail_after: 2, recover_after: 2 }
+  - name: wg-b
+    mark: 0x2
+    health: { targets: [198.51.100.1], interval: 300ms, timeout: 200ms, fail_after: 2, recover_after: 2 }
+default_order: [%s]
+ingress: { interfaces: [lan0] }
+learning:
+  enabled: true
+  candidates: { source: adguard, refresh: 1s, adguard: { url: "http://127.0.0.1:3000/" } }
+  probe: { timeout: 500ms }
+log: { level: debug }
+status: { socket: %s }
+`
+
+// Learning from an AdGuard Home query log: a destination that only wg-a
+// answers on TCP 443 is learned for wg-a although wg-b is the default; one
+// both answer alike stays on the default. A restart keeps what was learned.
+func TestLearning(t *testing.T) {
+	topology(t)
+	bin := filepath.Join(t.TempDir(), "tunsel")
+	if out, err := exec.Command("go", "build", "-o", bin, "../../cmd/tunsel").CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, out)
+	}
+	sh(t, nsB, "nft add rule inet c in ip daddr "+dstLearn+" tcp dport 443 drop")
+
+	// A static query log, served in the router's namespace; its entries
+	// are dated ahead, so every poll of the daemon would count them, but
+	// the daemon's cursor counts each once.
+	web := t.TempDir()
+	os.MkdirAll(filepath.Join(web, "control"), 0o755)
+	at := time.Now().Add(time.Minute).Format(time.RFC3339Nano)
+	log := fmt.Sprintf(`{"oldest": %[1]q, "data": [
+		{"time": %[1]q, "client": "10.99.0.2", "question": {"name": "learn.example.", "type": "A"}, "answer": [{"type": "A", "value": %[2]q}]},
+		{"time": %[1]q, "client": "10.99.0.2", "question": {"name": "default.example.", "type": "A"}, "answer": [{"type": "A", "value": %[3]q}]}
+	]}`, at, dstLearn, dstDefault)
+	if err := os.WriteFile(filepath.Join(web, "control", "querylog"), []byte(log), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	srv := exec.Command("ip", "netns", "exec", nsRtr, "python3", "-m", "http.server", "--bind", "127.0.0.1", "--directory", web, "3000")
+	if err := srv.Start(); err != nil {
+		t.Skipf("no python3 for the fake AdGuard Home: %v", err)
+	}
+	t.Cleanup(func() { srv.Process.Kill(); srv.Wait() })
+
+	d := startWith(t, bin, learnTmpl)
+	learned := func() map[string]string {
+		r, err := status.Fetch(d.socket, status.Request{Learned: true})
+		if err != nil || r.Learning == nil {
+			return nil
+		}
+		out := map[string]string{}
+		for _, e := range r.Learning.Entries {
+			out[e.Addr.String()] = e.Outcome + ":" + e.Tunnel
+		}
+		return out
+	}
+	eventually(t, "both destinations measured", func() bool { return len(learned()) == 2 })
+	if got := learned(); got[dstLearn] != "learned:wg-a" || !strings.HasPrefix(got[dstDefault], "baseline:") && !strings.HasPrefix(got[dstDefault], "no gain:") {
+		t.Fatalf("measured: %v", got)
+	}
+	if got := via(t, nsLAN, ping(dstLearn)); got != "wg-a" {
+		t.Errorf("learned destination via %s, want wg-a", got)
+	}
+	if got := via(t, nsLAN, ping(dstDefault)); got != "wg-b" {
+		t.Errorf("default destination via %s, want wg-b", got)
+	}
+	if r := d.report(t); r.Tunnels[0].Learned < 1 || r.Learning.Learned != 1 || r.Learning.LastError != "" {
+		t.Errorf("report: wg-a learned %d, %+v", r.Tunnels[0].Learned, r.Learning)
+	}
+	if !strings.Contains(sh(t, nsRtr, "nft list map inet tunsel learned4"), dstLearn+" timeout 1h") {
+		t.Error("learned element missing")
+	}
+
+	// A restart adopts the installed entry instead of forgetting it.
+	d.cmd.Process.Signal(syscall.SIGTERM)
+	if err := d.cmd.Wait(); err != nil {
+		t.Fatalf("exit: %v", err)
+	}
+	d.run(t)
+	eventually(t, "daemon back", func() bool { return d.state("wg-a") == "healthy" && d.state("wg-b") == "healthy" })
+	if got := learned(); got[dstLearn] != "learned:wg-a" {
+		t.Errorf("after restart: %v", got)
+	}
+	if got := via(t, nsLAN, ping(dstLearn)); got != "wg-a" {
+		t.Errorf("learned destination via %s after restart, want wg-a", got)
+	}
+	if !strings.Contains(d.log.String(), "adopted learned destinations") {
+		t.Error("adoption not logged")
+	}
 }

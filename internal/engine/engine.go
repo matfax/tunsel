@@ -3,6 +3,8 @@
 package engine
 
 import (
+	"net/netip"
+
 	"github.com/matfax/tunsel/internal/config"
 	"github.com/matfax/tunsel/internal/nft"
 	"github.com/matfax/tunsel/internal/ranges"
@@ -74,4 +76,34 @@ func Build(cfg *config.Config, healthy func(tunnel string) bool, prev Defaults) 
 	}
 	rs.Default4, rs.Default6 = d.V4, d.V6
 	return rs, d
+}
+
+// Excluded reports whether cfg never steers addr.
+func Excluded(cfg *config.Config, addr netip.Addr) bool {
+	for _, p := range cfg.Exclude {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+// Route returns the tunnel a new connection to addr takes without a
+// learned entry, the way the ruleset of Build decides it: the most
+// specific static preference of a healthy tunnel (static true), else the
+// family's default ("" if there is none).
+func Route(cfg *config.Config, healthy func(tunnel string) bool, d Defaults, addr netip.Addr) (tunnel string, static bool) {
+	bits := -1
+	for _, s := range cfg.StaticPref {
+		if s.Prefix.Bits() > bits && s.Prefix.Contains(addr) && healthy(s.Tunnel) {
+			tunnel, bits = s.Tunnel, s.Prefix.Bits()
+		}
+	}
+	if bits >= 0 {
+		return tunnel, true
+	}
+	if addr.Is4() {
+		return d.V4, false
+	}
+	return d.V6, false
 }

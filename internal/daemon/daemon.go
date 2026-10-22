@@ -19,6 +19,7 @@ import (
 	"github.com/matfax/tunsel/internal/engine"
 	"github.com/matfax/tunsel/internal/flows"
 	"github.com/matfax/tunsel/internal/health"
+	"github.com/matfax/tunsel/internal/learn"
 	"github.com/matfax/tunsel/internal/nft"
 	"github.com/matfax/tunsel/internal/status"
 )
@@ -44,6 +45,9 @@ type Options struct {
 	FlushConntrack func(mark, mask uint32) error
 	// DumpFlows reads the conntrack table. Defaults to netlink.
 	DumpFlows func() ([]flows.Entry, error)
+	// LearnSource builds the learning candidate source for cfg. Defaults
+	// to conntrack or AdGuard Home as configured.
+	LearnSource func(cfg *config.Config) learn.Source
 }
 
 // Tables is the nftables side; *nft.Manager in production.
@@ -53,6 +57,8 @@ type Tables interface {
 	Delete(table string) error
 	Defaults(table string) (v4, v6 string, err error)
 	Counters(table string) (map[string]nft.Counter, error)
+	AddLearned(table string, ls []nft.Learned) error
+	Learned(table string, tunnels []string) ([]nft.Learned, error)
 }
 
 type Daemon struct {
@@ -76,6 +82,14 @@ type Daemon struct {
 
 	events chan health.Event
 	flows  *flows.Cache
+
+	// Learning (design §7); guarded by mu except learnDone.
+	learner   *learn.Learner
+	learnStat status.Learning // the last round
+	learnStop context.CancelFunc
+	learnDone sync.WaitGroup
+	source    learn.Source
+	sourceCfg config.Candidates // what source was built from
 }
 
 func New(cfg *config.Config, opts Options) *Daemon {
@@ -90,7 +104,8 @@ func New(cfg *config.Config, opts Options) *Daemon {
 	}
 	return &Daemon{
 		opts: opts, log: opts.Log, cfg: cfg, events: make(chan health.Event, 16),
-		flows: &flows.Cache{MaxAge: FlowsMaxAge, Dump: opts.DumpFlows},
+		flows:   &flows.Cache{MaxAge: FlowsMaxAge, Dump: opts.DumpFlows},
+		learner: learn.New(),
 	}
 }
 
@@ -105,6 +120,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	defer signal.Stop(hup)
 
 	d.adoptInstalledDefaults()
+	d.adoptInstalledLearned()
 	// The first health round runs before nft is touched, so a restart keeps
 	// the previous table until a fresh decision is available.
 	if err := d.activate(ctx, d.cfg, nil); err != nil {
@@ -114,6 +130,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return fmt.Errorf("status socket: %w", err)
 	}
 	d.log.Info("started", "version", d.opts.Version, "table", d.cfg.NFT.Table, "tunnels", len(d.cfg.Tunnels))
+	d.restartLearning(ctx)
 
 	reconcile := time.NewTicker(ReconcileInterval)
 	defer reconcile.Stop()
@@ -145,6 +162,31 @@ func (d *Daemon) adoptInstalledDefaults() {
 		byChain[nft.ChainName(t.Name)] = t.Name
 	}
 	d.defaults = engine.Defaults{V4: byChain[v4], V6: byChain[v6]}
+}
+
+// adoptInstalledLearned takes over the learned destinations of a table
+// left by a previous run with their remaining time, so a restart does not
+// forget them. The first apply drops those of unhealthy tunnels.
+func (d *Daemon) adoptInstalledLearned() {
+	if !d.cfg.Learning.Enabled {
+		return
+	}
+	var names []string
+	for _, t := range d.cfg.Tunnels {
+		names = append(names, t.Name)
+	}
+	ls, err := d.opts.NFT.Learned(d.cfg.NFT.Table, names)
+	if err != nil {
+		d.log.Warn("reading installed learned destinations", "err", err)
+		return
+	}
+	now := time.Now()
+	for _, l := range ls {
+		d.learner.Store(&learn.Record{Addr: l.Addr, Tunnel: l.Tunnel, Outcome: learn.Learned, Decided: now, Expires: now.Add(l.Timeout)})
+	}
+	if len(ls) > 0 {
+		d.log.Info("adopted learned destinations", "count", len(ls))
+	}
 }
 
 // activate switches to cfg (old is the configuration being replaced, nil
@@ -231,6 +273,7 @@ func (d *Daemon) reload(ctx context.Context) {
 		d.log.Error("reload failed; keeping current configuration", "err", err)
 		return
 	}
+	d.restartLearning(ctx)
 	if cfg.Status.Socket != old.Status.Socket || cfg.Log.Format != old.Log.Format {
 		d.log.Warn("status.socket and log.format changes take effect after a restart")
 	}
@@ -261,7 +304,9 @@ func (d *Daemon) applyLocked(cfg *config.Config, monitors map[string]*health.Mon
 	for name, m := range monitors {
 		states[name] = m.State()
 	}
-	rs, defs := engine.Build(cfg, func(n string) bool { return states[n] == health.Healthy }, d.defaults)
+	healthy := func(n string) bool { return states[n] == health.Healthy }
+	rs, defs := engine.Build(cfg, healthy, d.defaults)
+	rs.Learned = d.learnedLocked(cfg, healthy, time.Now())
 	if err := d.opts.NFT.Apply(rs, alsoDelete...); err != nil {
 		d.apply = status.Apply{At: time.Now(), Error: err.Error()}
 		d.log.Error("nft apply failed", "err", err)
@@ -287,7 +332,34 @@ func (d *Daemon) applyLocked(cfg *config.Config, monitors map[string]*health.Mon
 	d.cfg, d.monitors, d.states = cfg, monitors, states
 	d.defaults, d.applied = defs, rs
 	d.apply = status.Apply{At: time.Now()}
+	// Measured again at the next refresh: destinations learned for a tunnel
+	// that failed, and those kept on a baseline that changed.
+	d.learner.Drop(func(r *learn.Record) bool {
+		if !cfg.Learning.Enabled {
+			return true
+		}
+		if r.Tunnel != "" {
+			return !healthy(r.Tunnel)
+		}
+		route, static := engine.Route(cfg, healthy, defs, r.Addr)
+		return static || route != r.Baseline
+	})
 	return nil
+}
+
+// learnedLocked returns the learned destinations to install with a new
+// table: those of healthy tunnels, with their remaining time.
+func (d *Daemon) learnedLocked(cfg *config.Config, healthy func(string) bool, now time.Time) []nft.Learned {
+	if !cfg.Learning.Enabled {
+		return nil
+	}
+	var out []nft.Learned
+	for _, r := range d.learner.Records() {
+		if left := r.Expires.Sub(now); r.Tunnel != "" && healthy(r.Tunnel) && left >= time.Second {
+			out = append(out, nft.Learned{Addr: r.Addr, Tunnel: r.Tunnel, Timeout: left})
+		}
+	}
+	return out
 }
 
 // flush deletes the conntrack entries of a tunnel, so their next packet is
@@ -318,6 +390,7 @@ func (d *Daemon) reconcile() {
 }
 
 func (d *Daemon) shutdown() error {
+	d.stopLearning()
 	d.mu.Lock()
 	stop := d.stop
 	d.mu.Unlock()
@@ -359,6 +432,22 @@ func (d *Daemon) report(req status.Request) status.Report {
 		r.Tunnels = append(r.Tunnels, tr)
 	}
 	r.Exclude = cover.Exclude
+	if cfg.Learning.Enabled {
+		l := d.learnStat
+		l.Source, l.Refresh = cfg.Learning.Candidates.Source, cfg.Learning.Candidates.Refresh.D().String()
+		recs := d.learner.Records()
+		for _, rec := range recs {
+			if rec.Tunnel != "" {
+				l.Learned++
+			} else {
+				l.Kept++
+			}
+		}
+		if req.Learned {
+			l.Entries = recs
+		}
+		r.Learning = &l
+	}
 	d.mu.Unlock()
 
 	// Netlink reads happen outside the lock, so a slow conntrack dump never
@@ -394,9 +483,10 @@ func addCounters(r *status.Report, cs map[string]nft.Counter) {
 	for i := range r.Tunnels {
 		t := &r.Tunnels[i]
 		t.Static = cs[nft.StaticCounter(t.Name)].Packets
+		t.Learned = cs[nft.LearnedCounter(t.Name)].Packets
 		t.Default = cs[nft.DefaultCounter(t.Name)].Packets
 		t.Upstream = cs[nft.RestoreCounter(t.Name)]
-		decided += t.Static + t.Default
+		decided += t.Static + t.Learned + t.Default
 	}
 	// The dump is not atomic: a connection may already be counted as
 	// decided but not yet as new.

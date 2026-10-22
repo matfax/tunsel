@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -104,9 +105,20 @@ type Learning struct {
 }
 
 type Candidates struct {
+	// Source is conntrack (the busiest current flows) or adguard (the
+	// addresses AdGuard Home resolved since the last refresh).
 	Source  string   `yaml:"source"`
 	TopN    int      `yaml:"top_n"`
 	Refresh Duration `yaml:"refresh"`
+	AdGuard AdGuard  `yaml:"adguard"`
+}
+
+// AdGuard is the AdGuard Home instance whose query log supplies the
+// candidates of source adguard.
+type AdGuard struct {
+	URL      string `yaml:"url"` // e.g. http://127.0.0.1:3000
+	Username string `yaml:"username"`
+	Password string `yaml:"password"`
 }
 
 type LearnProbe struct {
@@ -292,11 +304,16 @@ func (c *Config) setDefaults() {
 }
 
 // setDefaults fills in the learning parameters (design §7). As elsewhere,
-// zero means the default.
+// zero means the default. AdGuard is polled more often than conntrack: it
+// reports addresses before their first connection.
 func (l *Learning) setDefaults() {
 	setDefault(&l.Candidates.Source, "conntrack")
 	setDefault(&l.Candidates.TopN, 100)
-	setDefault(&l.Candidates.Refresh, Duration(5*time.Minute))
+	if l.Candidates.Source == "adguard" {
+		setDefault(&l.Candidates.Refresh, Duration(time.Minute))
+	} else {
+		setDefault(&l.Candidates.Refresh, Duration(5*time.Minute))
+	}
 	setDefault(&l.Probe.Port, 443)
 	setDefault(&l.Probe.Samples, 3)
 	setDefault(&l.Probe.Timeout, Duration(2*time.Second))
@@ -338,7 +355,7 @@ func (c *Config) validate() error {
 	c.validateDefaultOrder(&errs, byName)
 	c.validateIngress(&errs, byName)
 	c.validateStaticPref(&errs, byName)
-	c.Learning.validate(&errs)
+	c.validateLearning(&errs)
 	c.validateMisc(&errs)
 
 	return errors.Join(errs...)
@@ -488,12 +505,20 @@ func (c *Config) validateStaticPref(errs *errList, byName map[string]*Tunnel) {
 	}
 }
 
-// validate checks the learning parameters, also while learning is off, so
-// that a typo shows up when it is saved rather than when learning is
-// switched on.
-func (l *Learning) validate(errs *errList) {
-	if l.Candidates.Source != "conntrack" {
-		errs.fail("learning.candidates.source %q: expected conntrack", l.Candidates.Source)
+// validateLearning checks the learning parameters, also while learning is
+// off, so that a typo shows up when it is saved rather than when learning
+// is switched on.
+func (c *Config) validateLearning(errs *errList) {
+	l := &c.Learning
+	if l.Enabled && len(c.Tunnels) < 2 {
+		errs.fail("learning.enabled: needs at least two tunnels to choose from")
+	}
+	switch l.Candidates.Source {
+	case "conntrack":
+	case "adguard":
+		validateAdGuard(errs, l.Candidates.AdGuard)
+	default:
+		errs.fail("learning.candidates.source %q: expected conntrack | adguard", l.Candidates.Source)
 	}
 	if l.Candidates.TopN < 1 {
 		errs.fail("learning.candidates.top_n: must be at least 1")
@@ -522,11 +547,23 @@ func (l *Learning) validate(errs *errList) {
 	}
 }
 
+func validateAdGuard(errs *errList, a AdGuard) {
+	u, err := url.Parse(a.URL)
+	switch {
+	case a.URL == "":
+		errs.fail("learning.candidates.adguard.url: required for source adguard (e.g. http://127.0.0.1:3000)")
+	case err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "":
+		errs.fail("learning.candidates.adguard.url %q: expected http(s)://host[:port][/path]", a.URL)
+	case u.User != nil:
+		errs.fail("learning.candidates.adguard.url: put the credentials in username and password")
+	}
+	if a.Password != "" && a.Username == "" {
+		errs.fail("learning.candidates.adguard: password without username")
+	}
+}
+
 // validateMisc checks the unimplemented features, logging and the status socket.
 func (c *Config) validateMisc(errs *errList) {
-	if c.Learning.Enabled {
-		errs.fail("learning.enabled: per-destination learning (phase 2) is not implemented in this version")
-	}
 	if c.Metrics.Listen != "" {
 		errs.fail("metrics.listen: the metrics endpoint is not implemented in this version; leave it empty")
 	}
