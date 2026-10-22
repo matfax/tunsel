@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/netip"
-	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -52,24 +51,11 @@ func (d *Daemon) stopLearning() {
 	}
 }
 
-// sourceLocked returns the candidate source for cfg. An AdGuard source is
-// kept across reloads that leave it unchanged, so its position in the
-// query log carries over.
+// sourceLocked returns the candidate source for cfg: the conntrack
+// entries carrying a tunnel's mark.
 func (d *Daemon) sourceLocked(cfg *config.Config) learn.Source {
 	if d.opts.LearnSource != nil {
 		return d.opts.LearnSource(cfg)
-	}
-	c := cfg.Learning.Candidates
-	if c.Source == "adguard" {
-		if a, ok := d.source.(*learn.AdGuard); ok && reflect.DeepEqual(c, d.sourceCfg) && a.LocalClients == cfg.Ingress.IncludeLocalOutput {
-			return a
-		}
-		d.source = &learn.AdGuard{
-			URL: c.AdGuard.URL, Username: c.AdGuard.Username, Password: c.AdGuard.Password,
-			Lookback: c.Refresh.D(), LocalClients: cfg.Ingress.IncludeLocalOutput,
-		}
-		d.sourceCfg = c
-		return d.source
 	}
 	marks := map[uint32]bool{}
 	for _, t := range cfg.Tunnels {
@@ -197,9 +183,9 @@ func (d *Daemon) commitLocked(cfg *config.Config, jobs []*learnJob, now time.Tim
 	for _, r := range recs {
 		d.learner.Store(r)
 		if r.Tunnel != "" {
-			d.log.Info("learned", "addr", r.Addr, "name", r.Name, "tunnel", r.Tunnel, "baseline", r.Baseline, "outcome", r.Outcome, "rtt", fmtRTT(r.RTT))
+			d.log.Info("learned", "addr", r.Addr, "tunnel", r.Tunnel, "baseline", r.Baseline, "outcome", r.Outcome, "rtt", fmtRTT(r.RTT))
 		} else {
-			d.log.Debug("measured", "addr", r.Addr, "name", r.Name, "baseline", r.Baseline, "outcome", r.Outcome, "rtt", fmtRTT(r.RTT))
+			d.log.Debug("measured", "addr", r.Addr, "baseline", r.Baseline, "outcome", r.Outcome, "rtt", fmtRTT(r.RTT))
 		}
 	}
 }

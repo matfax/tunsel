@@ -121,24 +121,9 @@ function learningOptions(s) {
 	s.taboption('learning', form.Flag, 'learning', _('Enabled'),
 		_('Measure the busiest destinations through every healthy tunnel and steer each to the fastest. Static preferences still win.'));
 
-	let o = s.taboption('learning', form.ListValue, 'learn_source', _('Destinations from'));
-	o.value('conntrack', _('Current connections (conntrack, by bytes)'));
-	o.value('adguard', _('AdGuard Home query log (by queries, before the first connection)'));
-	o.default = 'conntrack';
-
-	o = value('learn_adguard_url', _('AdGuard Home URL'),
-		_('Its web interface; the query log must be enabled there.'), 'http://127.0.0.1:3000', 'string');
-	o.depends('learn_source', 'adguard');
-	o.rmempty = false;
-	o = value('learn_adguard_username', _('AdGuard Home user'), null, '', 'string');
-	o.depends('learn_source', 'adguard');
-	o = value('learn_adguard_password', _('AdGuard Home password'), null, '', 'string');
-	o.depends('learn_source', 'adguard');
-	o.password = true;
-
 	value('learn_top_n', _('Destinations per refresh'),
-		_('The most used destinations that have no measurement yet are measured.'), '100', count);
-	value('learn_refresh', _('Refresh interval'), _('Default 1m for AdGuard Home, 5m for conntrack.'), '', duration);
+		_('The current connections are ranked by bytes per destination; the busiest that have no measurement yet are measured.'), '100', count);
+	value('learn_refresh', _('Refresh interval'), null, '5m', duration);
 	value('learn_port', _('Probe port'),
 		_('TCP handshake time to this port via each healthy tunnel.'), '443', 'port');
 	value('learn_samples', _('Samples'), _('Handshakes per tunnel; the median counts.'), '3', count);

@@ -329,7 +329,7 @@ func (r *Report) renderLearned(w io.Writer, tw *tabwriter.Writer) {
 	}
 	es := r.Learning.Entries
 	fmt.Fprintf(w, "\nlearned destinations, most recent first (%d of %d)\n", min(len(es), LearnedShown), len(es))
-	fmt.Fprintln(tw, "DESTINATION\tNAME\tTUNNEL\tBASELINE\tOUTCOME\tHANDSHAKE\tEXPIRES IN")
+	fmt.Fprintln(tw, "DESTINATION\tTUNNEL\tBASELINE\tOUTCOME\tHANDSHAKE\tEXPIRES IN")
 	for _, e := range es[:min(len(es), LearnedShown)] {
 		names := make([]string, 0, len(e.RTT))
 		for n := range e.RTT {
@@ -340,7 +340,7 @@ func (r *Report) renderLearned(w io.Writer, tw *tabwriter.Writer) {
 		for _, n := range names {
 			rtts = append(rtts, n+" "+millis(e.RTT[n]))
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", e.Addr, orDash(e.Name), orDash(e.Tunnel), orDash(e.Baseline), e.Outcome,
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", e.Addr, orDash(e.Tunnel), orDash(e.Baseline), e.Outcome,
 			orDash(strings.Join(rtts, ", ")), time.Until(e.Expires).Round(time.Second))
 	}
 	tw.Flush()

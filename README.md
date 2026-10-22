@@ -4,10 +4,9 @@ Health-aware selection between VPN tunnels on a Linux router. New connections
 from the LAN go to the first healthy tunnel in a configured order, with static
 per-prefix preferences; when a tunnel fails, traffic moves to the next one and
 moves back on recovery. Optionally, tunsel learns the fastest tunnel per
-destination: it takes the addresses AdGuard Home resolves (or the busiest
-current connections), times a TCP handshake to port 443 through every healthy
-tunnel, and steers new connections to each destination through the fastest
-one for an hour. tunsel owns one nftables table and nothing else: interfaces,
+destination: it takes the busiest current connections, times a TCP handshake
+to port 443 through every healthy tunnel, and steers new connections to each
+destination through the fastest one for an hour. tunsel owns one nftables table and nothing else: interfaces,
 routing tables, policy rules and the firewall stay with the host.
 
 See [DESIGN.md](DESIGN.md) for the design, the full ruleset and failure
@@ -71,15 +70,11 @@ tunsel status                        # -flows: conntrack per tunnel; -history: R
 logread -e tunsel
 ```
 
-Latency learning from AdGuard Home (its query log must be enabled; DESIGN.md
-§7 has the details, LuCI the same options under Latency learning):
+Latency learning (DESIGN.md §7 has the details, LuCI the same options under
+Latency learning):
 
 ```sh
 uci set tunsel.main.learning=1
-uci set tunsel.main.learn_source=adguard
-uci set tunsel.main.learn_adguard_url=http://127.0.0.1:3000
-uci set tunsel.main.learn_adguard_username=admin
-uci set tunsel.main.learn_adguard_password='…'
 uci commit tunsel                    # reloads the daemon
 tunsel status -learned               # what was measured and where it goes
 ```

@@ -204,7 +204,7 @@ function learnedSection(learned) {
 		return E('div');
 	const entries = learned.learning.entries ?? [];
 	const rows = entries.slice(0, LEARNED_SHOWN).map((e) => [
-		lines(e.name ? [ e.addr, E('small', {}, [ text(e.name) ]) ] : [ e.addr ]),
+		e.addr,
 		e.tunnel ? E('strong', {}, [ text(e.tunnel) ]) : '–',
 		e.baseline || '–',
 		e.outcome,

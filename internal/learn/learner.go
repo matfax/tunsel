@@ -29,7 +29,6 @@ const Grace = 2 * time.Second
 // until Expires, so a destination is not measured again before then.
 type Record struct {
 	Addr netip.Addr `json:"addr"`
-	Name string     `json:"name,omitempty"`
 	// Tunnel is the learned tunnel; "" leaves the destination to its
 	// baseline (the static preference or default it takes without one).
 	Tunnel   string                   `json:"tunnel,omitempty"`
@@ -129,7 +128,7 @@ func (l *Learner) Select(cands []Candidate, n int, eligible func(netip.Addr) boo
 // tunnels may still be learned.
 func (l *Learner) Decide(c Candidate, rtt map[string]time.Duration, baseline string, healthy func(string) bool, p *config.Learning, now time.Time) *Record {
 	r := &Record{
-		Addr: c.Addr, Name: c.Name, Baseline: baseline, RTT: map[string]health.Millis{},
+		Addr: c.Addr, Baseline: baseline, RTT: map[string]health.Millis{},
 		Decided: now, Expires: now.Add(p.TTL.D()),
 	}
 	var names []string

@@ -82,8 +82,8 @@ func TestServeFetch(t *testing.T) {
 func TestRender(t *testing.T) {
 	r := sample()
 	r.Tunnels[0].Learned = 7
-	r.Learning = &Learning{Source: "adguard", Refresh: "1m0s", LastRound: time.Now(), Seen: 40, Measured: 12, Learned: 1, Kept: 1, Entries: []learn.Record{
-		{Addr: netip.MustParseAddr("198.18.0.1"), Name: "a.example", Tunnel: "wg-a", Baseline: "wg-b", Outcome: learn.Learned,
+	r.Learning = &Learning{Source: "conntrack", Refresh: "5m0s", LastRound: time.Now(), Seen: 40, Measured: 12, Learned: 1, Kept: 1, Entries: []learn.Record{
+		{Addr: netip.MustParseAddr("198.18.0.1"), Tunnel: "wg-a", Baseline: "wg-b", Outcome: learn.Learned,
 			RTT: map[string]health.Millis{"wg-b": health.Millis(40 * time.Millisecond), "wg-a": health.Millis(10 * time.Millisecond)}, Expires: time.Now().Add(time.Hour)},
 		{Addr: netip.MustParseAddr("198.18.0.2"), Baseline: "wg-b", Outcome: learn.NoAnswer, Expires: time.Now().Add(time.Hour)},
 	}}
@@ -99,10 +99,10 @@ func TestRender(t *testing.T) {
 		"12.0ms", "10.0ms",
 		"3.0 MiB, 9 pkts",
 		"▁·█ (max 8.0ms)",
-		"learning: adguard every 1m0s, last round 0s ago: 40 seen, 12 measured; 1 destinations learned, 1 kept on their baseline",
+		"learning: conntrack every 5m0s, last round 0s ago: 40 seen, 12 measured; 1 destinations learned, 1 kept on their baseline",
 		"wg-a    3       7        1",
-		"198.18.0.1   a.example  wg-a    wg-b      learned    wg-a 10.0ms, wg-b 40.0ms",
-		"198.18.0.2   -          -       wg-b      no answer  -",
+		"198.18.0.1   wg-a    wg-b      learned    wg-a 10.0ms, wg-b 40.0ms",
+		"198.18.0.2   -       wg-b      no answer  -",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output lacks %q:\n%s", want, out)

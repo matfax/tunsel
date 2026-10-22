@@ -460,15 +460,16 @@ default_order: [%s]
 ingress: { interfaces: [lan0] }
 learning:
   enabled: true
-  candidates: { source: adguard, refresh: 1s, adguard: { url: "http://127.0.0.1:3000/" } }
+  candidates: { refresh: 1s }
   probe: { timeout: 500ms }
 log: { level: debug }
 status: { socket: %s }
 `
 
-// Learning from an AdGuard Home query log: a destination that only wg-a
-// answers on TCP 443 is learned for wg-a although wg-b is the default; one
-// both answer alike stays on the default. A restart keeps what was learned.
+// Learning from conntrack: of two destinations the LAN talks to via the
+// default wg-b, one only wg-a answers on TCP 443; it is learned for wg-a
+// and its next connection goes there. The other, which both answer alike,
+// stays on the default. A restart keeps what was learned.
 func TestLearning(t *testing.T) {
 	topology(t)
 	bin := filepath.Join(t.TempDir(), "tunsel")
@@ -477,26 +478,8 @@ func TestLearning(t *testing.T) {
 	}
 	sh(t, nsB, "nft add rule inet c in ip daddr "+dstLearn+" tcp dport 443 drop")
 
-	// A static query log, served in the router's namespace; its entries
-	// are dated ahead, so every poll of the daemon would count them, but
-	// the daemon's cursor counts each once.
-	web := t.TempDir()
-	os.MkdirAll(filepath.Join(web, "control"), 0o755)
-	at := time.Now().Add(time.Minute).Format(time.RFC3339Nano)
-	log := fmt.Sprintf(`{"oldest": %[1]q, "data": [
-		{"time": %[1]q, "client": "10.99.0.2", "question": {"name": "learn.example.", "type": "A"}, "answer": [{"type": "A", "value": %[2]q}]},
-		{"time": %[1]q, "client": "10.99.0.2", "question": {"name": "default.example.", "type": "A"}, "answer": [{"type": "A", "value": %[3]q}]}
-	]}`, at, dstLearn, dstDefault)
-	if err := os.WriteFile(filepath.Join(web, "control", "querylog"), []byte(log), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	srv := exec.Command("ip", "netns", "exec", nsRtr, "python3", "-m", "http.server", "--bind", "127.0.0.1", "--directory", web, "3000")
-	if err := srv.Start(); err != nil {
-		t.Skipf("no python3 for the fake AdGuard Home: %v", err)
-	}
-	t.Cleanup(func() { srv.Process.Kill(); srv.Wait() })
-
 	d := startWith(t, bin, learnTmpl)
+	eventually(t, "both tunnels healthy", func() bool { return d.state("wg-a") == "healthy" && d.state("wg-b") == "healthy" })
 	learned := func() map[string]string {
 		r, err := status.Fetch(d.socket, status.Request{Learned: true})
 		if err != nil || r.Learning == nil {
@@ -508,10 +491,18 @@ func TestLearning(t *testing.T) {
 		}
 		return out
 	}
+
+	// The flows that make both destinations candidates, via the default.
+	for _, dst := range []string{dstLearn, dstDefault} {
+		if got := via(t, nsLAN, ping(dst)); got != "wg-b" {
+			t.Fatalf("%s via %s before learning, want wg-b", dst, got)
+		}
+	}
 	eventually(t, "both destinations measured", func() bool { return len(learned()) == 2 })
 	if got := learned(); got[dstLearn] != "learned:wg-a" || !strings.HasPrefix(got[dstDefault], "baseline:") && !strings.HasPrefix(got[dstDefault], "no gain:") {
 		t.Fatalf("measured: %v", got)
 	}
+	// A new ping is a new connection (another ICMP id).
 	if got := via(t, nsLAN, ping(dstLearn)); got != "wg-a" {
 		t.Errorf("learned destination via %s, want wg-a", got)
 	}

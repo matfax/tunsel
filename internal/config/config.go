@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
-	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -105,20 +104,10 @@ type Learning struct {
 }
 
 type Candidates struct {
-	// Source is conntrack (the busiest current flows) or adguard (the
-	// addresses AdGuard Home resolved since the last refresh).
+	// Source is conntrack: the busiest current flows.
 	Source  string   `yaml:"source"`
 	TopN    int      `yaml:"top_n"`
 	Refresh Duration `yaml:"refresh"`
-	AdGuard AdGuard  `yaml:"adguard"`
-}
-
-// AdGuard is the AdGuard Home instance whose query log supplies the
-// candidates of source adguard.
-type AdGuard struct {
-	URL      string `yaml:"url"` // e.g. http://127.0.0.1:3000
-	Username string `yaml:"username"`
-	Password string `yaml:"password"`
 }
 
 type LearnProbe struct {
@@ -304,16 +293,11 @@ func (c *Config) setDefaults() {
 }
 
 // setDefaults fills in the learning parameters (design §7). As elsewhere,
-// zero means the default. AdGuard is polled more often than conntrack: it
-// reports addresses before their first connection.
+// zero means the default.
 func (l *Learning) setDefaults() {
 	setDefault(&l.Candidates.Source, "conntrack")
 	setDefault(&l.Candidates.TopN, 100)
-	if l.Candidates.Source == "adguard" {
-		setDefault(&l.Candidates.Refresh, Duration(time.Minute))
-	} else {
-		setDefault(&l.Candidates.Refresh, Duration(5*time.Minute))
-	}
+	setDefault(&l.Candidates.Refresh, Duration(5*time.Minute))
 	setDefault(&l.Probe.Port, 443)
 	setDefault(&l.Probe.Samples, 3)
 	setDefault(&l.Probe.Timeout, Duration(2*time.Second))
@@ -513,12 +497,8 @@ func (c *Config) validateLearning(errs *errList) {
 	if l.Enabled && len(c.Tunnels) < 2 {
 		errs.fail("learning.enabled: needs at least two tunnels to choose from")
 	}
-	switch l.Candidates.Source {
-	case "conntrack":
-	case "adguard":
-		validateAdGuard(errs, l.Candidates.AdGuard)
-	default:
-		errs.fail("learning.candidates.source %q: expected conntrack | adguard", l.Candidates.Source)
+	if l.Candidates.Source != "conntrack" {
+		errs.fail("learning.candidates.source %q: expected conntrack", l.Candidates.Source)
 	}
 	if l.Candidates.TopN < 1 {
 		errs.fail("learning.candidates.top_n: must be at least 1")
@@ -544,21 +524,6 @@ func (c *Config) validateLearning(errs *errList) {
 	}
 	if l.MinGain.Abs < 0 {
 		errs.fail("learning.min_gain.abs: must not be negative")
-	}
-}
-
-func validateAdGuard(errs *errList, a AdGuard) {
-	u, err := url.Parse(a.URL)
-	switch {
-	case a.URL == "":
-		errs.fail("learning.candidates.adguard.url: required for source adguard (e.g. http://127.0.0.1:3000)")
-	case err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "":
-		errs.fail("learning.candidates.adguard.url %q: expected http(s)://host[:port][/path]", a.URL)
-	case u.User != nil:
-		errs.fail("learning.candidates.adguard.url: put the credentials in username and password")
-	}
-	if a.Password != "" && a.Username == "" {
-		errs.fail("learning.candidates.adguard: password without username")
 	}
 }
 

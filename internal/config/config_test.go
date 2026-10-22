@@ -53,20 +53,17 @@ var oneTunnel = strings.Replace(strings.Replace(base, `  - name: wg-b
     health: { targets: [198.51.100.1] }
 `, "", 1), "[wg-b, wg-a]", "[wg-a]", 1)
 
-// Learning is accepted with two tunnels; AdGuard is polled more often.
+// Learning is accepted with two tunnels.
 func TestLearningConfig(t *testing.T) {
 	if _, err := Parse([]byte(oneTunnel)); err != nil {
 		t.Fatalf("one tunnel without learning: %v", err)
 	}
-	c, err := Parse([]byte(base + "learning: { enabled: true, candidates: { source: adguard, adguard: { url: \"http://127.0.0.1:3000\", username: admin, password: secret } } }\n"))
+	c, err := Parse([]byte(base + "learning: { enabled: true }\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if l := c.Learning; !l.Enabled || l.Candidates.Refresh.D() != time.Minute || l.Candidates.AdGuard.Username != "admin" {
+	if l := c.Learning; !l.Enabled || l.Candidates.Source != "conntrack" || l.Candidates.Refresh.D() != 5*time.Minute {
 		t.Errorf("learning: %+v", l)
-	}
-	if c, _ := Parse([]byte(base)); c.Learning.Candidates.Refresh.D() != 5*time.Minute {
-		t.Errorf("conntrack refresh: %s", c.Learning.Candidates.Refresh.D())
 	}
 }
 
@@ -113,11 +110,7 @@ func TestInvalid(t *testing.T) {
 		{"ingress tunnel", strings.Replace(base, "[lan0]", "[wg-a]", 1), "is a tunnel"},
 		{"chain name collision", strings.Replace(base, "name: wg-b", "name: wg.a", 1), "same nft chain"},
 		{"learning one tunnel", oneTunnel + "learning: { enabled: true }\n", "needs at least two tunnels"},
-		{"learning source", base + "learning: { candidates: { source: dns } }\n", `source "dns": expected conntrack | adguard`},
-		{"adguard url", base + "learning: { candidates: { source: adguard } }\n", "adguard.url: required"},
-		{"adguard scheme", base + "learning: { candidates: { source: adguard, adguard: { url: 127.0.0.1:3000 } } }\n", "expected http(s)://"},
-		{"adguard userinfo", base + "learning: { candidates: { source: adguard, adguard: { url: \"http://a:b@127.0.0.1\" } } }\n", "put the credentials"},
-		{"adguard password", base + "learning: { candidates: { source: adguard, adguard: { url: \"http://127.0.0.1\", password: x } } }\n", "password without username"},
+		{"learning source", base + "learning: { candidates: { source: dns } }\n", `source "dns": expected conntrack`},
 		{"learning top_n", base + "learning: { candidates: { top_n: -1 } }\n", "top_n: must be at least 1"},
 		{"learning ttl", base + "learning: { ttl: -1h }\n", "learning.ttl: must be positive"},
 		{"learning percent", base + "learning: { min_gain: { rel: 15 } }\n", `invalid percentage "15"`},

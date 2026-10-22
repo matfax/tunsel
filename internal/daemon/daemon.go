@@ -46,7 +46,7 @@ type Options struct {
 	// DumpFlows reads the conntrack table. Defaults to netlink.
 	DumpFlows func() ([]flows.Entry, error)
 	// LearnSource builds the learning candidate source for cfg. Defaults
-	// to conntrack or AdGuard Home as configured.
+	// to conntrack.
 	LearnSource func(cfg *config.Config) learn.Source
 }
 
@@ -88,8 +88,6 @@ type Daemon struct {
 	learnStat status.Learning // the last round
 	learnStop context.CancelFunc
 	learnDone sync.WaitGroup
-	source    learn.Source
-	sourceCfg config.Candidates // what source was built from
 }
 
 func New(cfg *config.Config, opts Options) *Daemon {

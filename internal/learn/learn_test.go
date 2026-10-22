@@ -2,13 +2,8 @@ package learn
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"net/netip"
-	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -19,121 +14,6 @@ import (
 )
 
 var addr = netip.MustParseAddr
-
-// fakeLog serves a query log like AdGuard Home: newest first, pages of
-// limit entries older than older_than.
-type fakeLog struct {
-	mu      sync.Mutex
-	entries []map[string]any // newest first
-	pages   int
-}
-
-func (f *fakeLog) add(at time.Time, client, name string, answers ...string) {
-	var ans []map[string]any
-	for _, a := range answers {
-		typ := "A"
-		if addr(a).Is6() {
-			typ = "AAAA"
-		}
-		ans = append(ans, map[string]any{"type": typ, "value": a, "ttl": 60})
-	}
-	ans = append(ans, map[string]any{"type": "HTTPS", "value": map[string]any{"hints": "x"}})
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.entries = append([]map[string]any{{
-		"time": at.Format(time.RFC3339Nano), "client": client,
-		"question": map[string]any{"name": name + ".", "type": "A"}, "answer": ans,
-	}}, f.entries...)
-}
-
-func (f *fakeLog) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if u, p, ok := r.BasicAuth(); !ok || u != "admin" || p != "secret" {
-		http.Error(w, "Forbidden", http.StatusForbidden)
-		return
-	}
-	if r.URL.Path != "/control/querylog" {
-		http.NotFound(w, r)
-		return
-	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.pages++
-	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	var page []map[string]any
-	for _, e := range f.entries {
-		if o := r.URL.Query().Get("older_than"); o != "" && !parseTime(e["time"]).Before(parseTime(o)) {
-			continue
-		}
-		if len(page) == limit {
-			break
-		}
-		page = append(page, e)
-	}
-	oldest := ""
-	if len(page) > 0 {
-		oldest = page[len(page)-1]["time"].(string)
-	}
-	json.NewEncoder(w).Encode(map[string]any{"data": page, "oldest": oldest})
-}
-
-func parseTime(v any) time.Time {
-	t, _ := time.Parse(time.RFC3339Nano, v.(string))
-	return t
-}
-
-func TestAdGuard(t *testing.T) {
-	log := &fakeLog{}
-	srv := httptest.NewServer(log)
-	defer srv.Close()
-	now := time.Date(2026, 10, 22, 12, 0, 0, 0, time.UTC)
-	a := &AdGuard{URL: srv.URL + "/", Username: "admin", Password: "secret", Lookback: time.Minute, Now: func() time.Time { return now }}
-
-	log.add(now.Add(-2*time.Minute), "10.0.0.2", "old.example", "198.18.0.9") // before the lookback
-	log.add(now.Add(-30*time.Second), "10.0.0.2", "a.example", "198.18.0.1", "2001:db8::1")
-	log.add(now.Add(-20*time.Second), "10.0.0.3", "a.example", "198.18.0.1")
-	log.add(now.Add(-10*time.Second), "127.0.0.1", "router.example", "198.18.0.2") // the router's own
-	cs, err := a.Candidates(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	got := map[netip.Addr]Candidate{}
-	for _, c := range cs {
-		got[c.Addr] = c
-	}
-	if len(got) != 2 || got[addr("198.18.0.1")].Hits != 2 || got[addr("198.18.0.1")].Name != "a.example" || got[addr("2001:db8::1")].Hits != 1 {
-		t.Errorf("first poll: %+v", cs)
-	}
-
-	// The next poll counts only newer entries, across pages.
-	for i := range adguardPage + 10 {
-		log.add(now.Add(time.Duration(i+1)*time.Millisecond), "10.0.0.2", "b.example", fmt.Sprintf("198.18.%d.%d", 1+i/250, i%250))
-	}
-	log.pages = 0
-	cs, err = a.Candidates(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(cs) != adguardPage+10 || log.pages != 2 {
-		t.Errorf("second poll: %d candidates in %d pages", len(cs), log.pages)
-	}
-	if cs, err := a.Candidates(context.Background()); err != nil || len(cs) != 0 {
-		t.Errorf("third poll: %v %v", cs, err)
-	}
-
-	a.LocalClients = true
-	a.cursor = time.Time{}
-	log.mu.Lock()
-	log.entries = log.entries[len(log.entries)-4:]
-	log.mu.Unlock()
-	if cs, _ := a.Candidates(context.Background()); len(cs) != 3 {
-		t.Errorf("with local clients: %+v", cs)
-	}
-
-	a.Password = "wrong"
-	if _, err := a.Candidates(context.Background()); err == nil || err.Error() != "adguard: 403 Forbidden: Forbidden" {
-		t.Errorf("bad password: %v", err)
-	}
-}
 
 func TestConntrack(t *testing.T) {
 	c := &Conntrack{Mask: 0xf, Marks: map[uint32]bool{1: true, 2: true}, Dump: func() ([]flows.Entry, error) {

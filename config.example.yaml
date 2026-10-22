@@ -64,16 +64,9 @@ conntrack:
 learning:
   enabled: false
   candidates:
-    # conntrack: current flows by bytes; adguard: addresses AdGuard Home
-    # resolved since the last refresh, by queries (before the first
-    # connection, so new destinations are measured sooner)
-    source: conntrack
+    source: conntrack      # steered flows, by bytes in both directions
     top_n: 100             # destinations without a measurement, per refresh
-    # refresh: 5m          # default: 5m for conntrack, 1m for adguard
-    adguard:
-      url: http://127.0.0.1:3000   # its web interface; query log enabled
-      username: ""
-      password: ""
+    refresh: 5m
   probe:
     port: 443              # TCP handshake time via each healthy tunnel
     samples: 3             # per tunnel; the median counts

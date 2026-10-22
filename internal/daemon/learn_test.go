@@ -19,7 +19,6 @@ exclude: [198.18.0.3/32]
 static_pref: [{ prefix: 203.0.113.0/24, tunnel: wg-a }]
 learning:
   enabled: %t
-  candidates: { source: adguard, adguard: { url: "http://127.0.0.1:3000" } }
 `
 
 func parseLearning(t *testing.T, enabled bool) *config.Config {
@@ -70,7 +69,7 @@ func learnHarness(t *testing.T) (*harness, context.Context) {
 }
 
 var cands = fixedSource{
-	{Addr: a("198.18.0.1"), Name: "fast-via-a.example", Score: 3},
+	{Addr: a("198.18.0.1"), Score: 3},
 	{Addr: a("198.18.0.2"), Score: 2},
 	{Addr: a("10.0.0.1"), Score: 9},    // private
 	{Addr: a("198.18.0.3"), Score: 9},  // excluded
@@ -96,7 +95,7 @@ func TestLearningRound(t *testing.T) {
 	for _, e := range l.Entries {
 		switch e.Addr {
 		case a("198.18.0.1"):
-			if e.Tunnel != "wg-a" || e.Baseline != "wg-b" || e.Name != "fast-via-a.example" || e.RTT["wg-a"].D() != 10*time.Millisecond {
+			if e.Tunnel != "wg-a" || e.Baseline != "wg-b" || e.RTT["wg-a"].D() != 10*time.Millisecond {
 				t.Errorf("learned entry: %+v", e)
 			}
 		case a("198.18.0.2"):
