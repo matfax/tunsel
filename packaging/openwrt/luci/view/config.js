@@ -36,6 +36,12 @@ function duration(_sid, value) {
 	return _('Expecting a duration, e.g. 10s or 500ms');
 }
 
+function percent(_sid, value) {
+	if (value === '' || /^\d+\.?\d*%$/.test(value))
+		return true;
+	return _('Expecting a percentage, e.g. 15%');
+}
+
 function probe(_sid, value) {
 	if (value === '' || value === 'icmp' || /^tcp:\d+$/.test(value))
 		return true;
@@ -97,6 +103,37 @@ function advancedOptions(s) {
 		_('Changes take effect after a restart.'));
 	o.placeholder = '/run/tunsel/tunsel.sock';
 	o.datatype = 'string';
+}
+
+// Phase 2 parameters (design §7). The switch itself is left out until
+// learning is implemented; the daemon rejects learning=1.
+function learningOptions(s) {
+	const value = (name, title, description, placeholder, check) => {
+		const o = s.taboption('learning', form.Value, name, title, description);
+		o.placeholder = placeholder;
+		if (typeof check === 'function')
+			o.validate = check;
+		else
+			o.datatype = check;
+		return o;
+	};
+	const count = 'and(uinteger,min(1))';
+
+	value('learn_top_n', _('Destinations per refresh'),
+		_('The busiest destinations by bytes that have no learned tunnel yet are measured.'), '100', count);
+	value('learn_refresh', _('Refresh interval'), null, '5m', duration);
+	value('learn_port', _('Probe port'),
+		_('TCP handshake time to this port via each healthy tunnel.'), '443', 'port');
+	value('learn_samples', _('Samples'), _('Handshakes per tunnel; the median counts.'), '3', count);
+	value('learn_timeout', _('Probe timeout'), null, '2s', duration);
+	value('learn_min_gain_abs', _('Minimum gain'),
+		_('A tunnel replaces the current choice only if it is faster by this much…'), '5ms', duration);
+	value('learn_min_gain_rel', _('Minimum relative gain'), _('…and by this share.'), '15%', percent);
+	value('learn_ttl', _('Lifetime'),
+		_('How long a learned tunnel is kept; the destination is measured again only after it expires.'), '1h', duration);
+	value('learn_damp_window', _('Damping window'), null, '30m', duration);
+	value('learn_damp_max_switches', _('Switches per window'),
+		_('At most this many tunnel changes per destination within the damping window.'), '2', count);
 }
 
 function tunnelGeneralOptions(s) {
@@ -170,8 +207,11 @@ return view.extend({
 		main.addremove = false;
 		main.tab('general', _('General'));
 		main.tab('advanced', _('Advanced'));
+		main.tab('learning', _('Latency learning'),
+			_('Per-destination selection of the fastest tunnel. Not active yet: this version stores these settings but does not learn.'));
 		generalOptions(main);
 		advancedOptions(main);
+		learningOptions(main);
 
 		const tunnels = m.section(form.GridSection, 'tunnel', _('Tunnels'));
 		tunnels.addremove = true;

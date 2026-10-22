@@ -11,8 +11,9 @@ import (
 // The UCI form of the configuration (/etc/config/tunsel on OpenWrt) is flat:
 // one "tunsel" section with the global options and one "tunnel" section per
 // tunnel, with the health options folded in and the tunnel's static
-// preferences as a "prefer" list. Learning and metrics have no UCI options
-// until they are implemented.
+// preferences as a "prefer" list. The learning options are flat options
+// of the main section, "learning" for the switch and "learn_*" for the
+// rest. Metrics have no UCI options until they are implemented.
 //
 //	config tunsel 'main'
 //		option enabled '1'          # read by the init script only
@@ -20,6 +21,7 @@ import (
 //		list default_order 'wg-a'
 //		list ingress 'br-lan'
 //		list exclude '10.0.0.0/8'
+//		option learn_ttl '1h'
 //
 //	config tunnel 'wg_a'            # section names cannot hold '-'
 //		option iface 'wg-a'
@@ -211,6 +213,16 @@ func (r uciReader) setUint32(o uciOption, dst *uint32) {
 	}
 }
 
+func (r uciReader) setUint16(o uciOption, dst *uint16) {
+	if v, ok := r.scalar(o); ok {
+		n, err := strconv.ParseUint(v, 10, 16)
+		if err != nil {
+			r.fail(o, "invalid number %q", v)
+		}
+		*dst = uint16(n)
+	}
+}
+
 func (r uciReader) setInt(o uciOption, dst *int) {
 	if v, ok := r.scalar(o); ok {
 		n, err := strconv.Atoi(v)
@@ -243,6 +255,16 @@ func (r uciReader) setDuration(o uciOption, dst *Duration) {
 			r.fail(o, "%v", err)
 		}
 		*dst = d
+	}
+}
+
+func (r uciReader) setPercent(o uciOption, dst *Percent) {
+	if v, ok := r.scalar(o); ok {
+		p, err := parsePercent(v)
+		if err != nil {
+			r.fail(o, "%v", err)
+		}
+		*dst = p
 	}
 }
 
@@ -340,7 +362,9 @@ func (c *Config) globalsFromUCI(r uciReader) {
 		case "socket":
 			r.setString(o, &c.Status.Socket)
 		default:
-			r.errs.fail("line %d: unknown option %q in tunsel section", o.line, o.name)
+			if !r.learning(o, &c.Learning) {
+				r.errs.fail("line %d: unknown option %q in tunsel section", o.line, o.name)
+			}
 		}
 	}
 }
@@ -393,6 +417,39 @@ func (r uciReader) health(o uciOption, h *Health) bool {
 		r.setInt(o, &h.FailAfter)
 	case "recover_after":
 		r.setInt(o, &h.RecoverAfter)
+	default:
+		return false
+	}
+	return true
+}
+
+// learning sets the learning option o and reports whether o is one.
+func (r uciReader) learning(o uciOption, l *Learning) bool {
+	switch o.name {
+	case "learning":
+		r.setBool(o, &l.Enabled)
+	case "learn_source":
+		r.setString(o, &l.Candidates.Source)
+	case "learn_top_n":
+		r.setInt(o, &l.Candidates.TopN)
+	case "learn_refresh":
+		r.setDuration(o, &l.Candidates.Refresh)
+	case "learn_port":
+		r.setUint16(o, &l.Probe.Port)
+	case "learn_samples":
+		r.setInt(o, &l.Probe.Samples)
+	case "learn_timeout":
+		r.setDuration(o, &l.Probe.Timeout)
+	case "learn_min_gain_abs":
+		r.setDuration(o, &l.MinGain.Abs)
+	case "learn_min_gain_rel":
+		r.setPercent(o, &l.MinGain.Rel)
+	case "learn_ttl":
+		r.setDuration(o, &l.TTL)
+	case "learn_damp_window":
+		r.setDuration(o, &l.FlapDamp.Window)
+	case "learn_damp_max_switches":
+		r.setInt(o, &l.FlapDamp.MaxSwitches)
 	default:
 		return false
 	}

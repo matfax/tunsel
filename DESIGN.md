@@ -115,10 +115,10 @@ Phase 2 adds `learned4`/`learned6` (`type ipv4_addr : verdict; flags timeout`), 
 The daemon owns the *effective* contents of `static*`, `learned*` and `pick4`/`pick6`:
 
 - `static*` is derived from config minus entries whose tunnel is unhealthy. Nested prefixes are flattened into disjoint intervals, the more specific prefix winning; when a specific entry is dropped, a covering static prefix (if any) takes over, otherwise the default applies.
-- `learned*` never contains entries for unhealthy tunnels.
+- `learned*` never contains entries for unhealthy tunnels. Each entry carries its own nft timeout (`ttl`), so the kernel expires it even when the daemon is not running.
 - `pick4`/`pick6` point at the first healthy tunnel in `default_order` that carries the family (`families`, default both). If none is healthy, the last value is kept (traffic fails closed via the firewall, never leaks). With no previous value (cold start, nothing healthy) the chain is empty and traffic stays unmarked.
 
-Every change replaces the whole table in one nft transaction (delete + create), so there is never a partially updated state; conntrack marks of existing connections are unaffected. The daemon re-checks every 15 s that its table exists and re-applies it if another tool removed it.
+Every health or config change replaces the whole table in one nft transaction (delete + create), so there is never a partially updated state; conntrack marks of existing connections are unaffected. Learning results are the exception: they are added to and removed from `learned*` as single elements, so a refresh does not rebuild the table. The daemon keeps its own copy of the learned entries with their expiry and never reads them back from nft; a full replacement re-adds the entries of healthy tunnels with their remaining timeout. The daemon re-checks every 15 s that its table exists and re-applies it if another tool removed it.
 
 ### 4.4 Counters
 
@@ -146,9 +146,10 @@ Health filtering is applied when materializing 2–4, so a dead tunnel is never 
 
 ## 7. Per-destination learning (phase 2)
 
-- **Candidates:** top-N destinations by bytes from conntrack (ingress-steered flows only), refreshed periodically.
+- **Candidates:** every `candidates.refresh`, the top-N (`candidates.top_n`) destinations by bytes from conntrack (ingress-steered flows only) that have **no learned entry**. Ranking happens after filtering, so all N slots go to untrained destinations.
+- **No re-training:** a learned entry is not measured again while it lives. When its `ttl` expires, the destination is untrained again and competes for a slot at the next refresh; until then its new connections take the static preference or the default.
 - **Measurement:** TCP handshake time to `probe.port` via each healthy tunnel (bound sockets), several samples, median.
-- **Decision:** switch only if the winner beats the current choice by `min_gain.abs` **and** `min_gain.rel`; store with `ttl`. Repeated flips within a window are damped.
+- **Decision:** the winner is stored with `ttl` only if it beats the tunnel the destination takes without a learned entry (static preference or default) by `min_gain.abs` **and** `min_gain.rel`. Changes of a destination's tunnel are counted over `flap_damping.window`, across expiries; after `flap_damping.max_switches` the current tunnel is kept until the window has passed.
 - **Caveat:** CDN answers depend on the resolver's location. A measurement compares paths to the *same* IP; it does not account for a different IP the other tunnel's resolver might have returned. Documented limitation, not solved in phase 2.
 - **Caveat:** ICMP is not used for learning (often deprioritized by VPN servers).
 
@@ -226,8 +227,8 @@ For OpenWrt and Turris OS, where Docker support is limited. Built without the SD
 - Architectures: opkg names mapped to the three Go targets (`arm_cortex-a*` → `arm/v7`, `aarch64_*` → `arm64`, `x86_64` → `amd64`); `IPK_ARCHS` in `Taskfile.yml` lists the released ones.
 - Depends: `kmod-nft-core`, `kmod-nft-fib`, `kmod-nf-conntrack-netlink` (ctnetlink is not part of a default image).
 - Files: `/usr/sbin/tunsel`, `/etc/init.d/tunsel`, `/etc/config/tunsel`.
-- Config: UCI, `/etc/config/tunsel`, shipped with `enabled 0` and the placeholder tunnels of `config.example.yaml`. It is a conffile: opkg keeps a changed one on upgrade and removal, and sysupgrade keeps it. The schema is flat: one `tunsel` section named `main` with the global options and the `enabled` switch (read by the init script only), and one `tunnel` section per tunnel with the interface as option `iface` (section names cannot hold `-`), the health options folded in and the tunnel's static preferences as list `prefer`. Learning and metrics have no UCI options until they are implemented.
-- `luci-app-tunsel` (`Architecture: all`, depends on `tunsel` and `luci-base`): Services → Tunsel in LuCI. The configuration page is a form on the UCI config; Save & Apply commits it, and the reload trigger reloads the daemon. The status page reads the report through an rpcd exec plugin (`/usr/libexec/rpcd/tunsel`, ubus object `tunsel` with methods `status`, `flows` and `history`, each running `tunsel status -json`), polls it every 5 s and draws the RTT history per target.
+- Config: UCI, `/etc/config/tunsel`, shipped with `enabled 0` and the placeholder tunnels of `config.example.yaml`. It is a conffile: opkg keeps a changed one on upgrade and removal, and sysupgrade keeps it. The schema is flat: one `tunsel` section named `main` with the global options and the `enabled` switch (read by the init script only), and one `tunnel` section per tunnel with the interface as option `iface` (section names cannot hold `-`), the health options folded in and the tunnel's static preferences as list `prefer`. The learning options are flat options of `main` (`learning` for the switch, `learn_top_n`, `learn_refresh`, `learn_port`, `learn_samples`, `learn_timeout`, `learn_min_gain_abs`, `learn_min_gain_rel`, `learn_ttl`, `learn_damp_window`, `learn_damp_max_switches`, `learn_source`); metrics have no UCI options until they are implemented.
+- `luci-app-tunsel` (`Architecture: all`, depends on `tunsel` and `luci-base`): Services → Tunsel in LuCI. The configuration page is a form on the UCI config, including a tab for the learning parameters (without the switch while learning is not implemented); Save & Apply commits it, and the reload trigger reloads the daemon. The status page reads the report through an rpcd exec plugin (`/usr/libexec/rpcd/tunsel`, ubus object `tunsel` with methods `status`, `flows` and `history`, each running `tunsel status -json`), polls it every 5 s and draws the RTT history per target.
 - Version: the tag without `v`; untagged builds are `0~<git describe>`, so they sort below every release.
 
 | Aspect | Behavior |
@@ -249,7 +250,7 @@ For OpenWrt and Turris OS, where Docker support is limited. Built without the SD
 
 ## 11. Phases
 
-1. **MVP (implemented):** config loading, nft table management, health checks with hysteresis, default switching, `exclude`, `static_pref` with health filtering, conntrack flush on failure, status command, container image. `learning.enabled: true` and a non-empty `metrics.listen` are rejected until phases 2 and 3.
+1. **MVP (implemented):** config loading, nft table management, health checks with hysteresis, default switching, `exclude`, `static_pref` with health filtering, conntrack flush on failure, status command, container image. `learning.enabled: true` and a non-empty `metrics.listen` are rejected until phases 2 and 3; the learning parameters are already parsed, defaulted and validated (YAML, UCI, LuCI) but unused.
 2. **Learning:** conntrack candidate selection, TCP probing, margins, TTL, damping.
 3. **Optional:** dynamic prefix sources for `static_pref` (URL lists with refresh), metrics.
 

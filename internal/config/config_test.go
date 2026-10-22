@@ -65,6 +65,11 @@ func TestDefaults(t *testing.T) {
 	if c.Status.Socket != DefaultSocket {
 		t.Errorf("socket: %s", c.Status.Socket)
 	}
+	l := c.Learning
+	if l.Candidates.Source != "conntrack" || l.Candidates.TopN != 100 || l.Probe.Port != 443 || l.Probe.Samples != 3 ||
+		l.MinGain.Rel != 0.15 || l.TTL.D() != time.Hour || l.FlapDamp.MaxSwitches != 2 {
+		t.Errorf("learning defaults: %+v", l)
+	}
 }
 
 func TestInvalid(t *testing.T) {
@@ -85,6 +90,10 @@ func TestInvalid(t *testing.T) {
 		{"ingress tunnel", strings.Replace(base, "[lan0]", "[wg-a]", 1), "is a tunnel"},
 		{"chain name collision", strings.Replace(base, "name: wg-b", "name: wg.a", 1), "same nft chain"},
 		{"learning", base + "learning: { enabled: true }\n", "not implemented"},
+		{"learning source", base + "learning: { candidates: { source: adguard } }\n", `source "adguard": expected conntrack`},
+		{"learning top_n", base + "learning: { candidates: { top_n: -1 } }\n", "top_n: must be at least 1"},
+		{"learning ttl", base + "learning: { ttl: -1h }\n", "learning.ttl: must be positive"},
+		{"learning percent", base + "learning: { min_gain: { rel: 15 } }\n", `invalid percentage "15"`},
 		{"duration", strings.Replace(base, `probe: "tcp:443"`, "interval: soon", 1), "invalid duration"},
 	}
 	for _, tc := range cases {

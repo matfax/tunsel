@@ -19,8 +19,8 @@ func TestUCIMatchesYAMLExample(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Learning and metrics have no UCI options yet.
-	y.Learning, y.Metrics = Learning{}, Metrics{}
+	// Metrics have no UCI options yet.
+	y.Metrics = Metrics{}
 	if !reflect.DeepEqual(y, u) {
 		t.Errorf("configs differ\nyaml: %+v\nuci:  %+v", y, u)
 	}
@@ -125,6 +125,35 @@ func TestUCIHealthOptions(t *testing.T) {
 	}
 }
 
+func TestUCILearningOptions(t *testing.T) {
+	c, err := ParseUCI([]byte(strings.Replace(uciBase, "list ingress 'lan0'", `list ingress 'lan0'
+	option learning '0'
+	option learn_source 'conntrack'
+	option learn_top_n '50'
+	option learn_refresh '10m'
+	option learn_port '8443'
+	option learn_samples '5'
+	option learn_timeout '1s'
+	option learn_min_gain_abs '10ms'
+	option learn_min_gain_rel '20%'
+	option learn_ttl '2h'
+	option learn_damp_window '1h'
+	option learn_damp_max_switches '3'`, 1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Learning{
+		Candidates: Candidates{Source: "conntrack", TopN: 50, Refresh: Duration(10 * time.Minute)},
+		Probe:      LearnProbe{Port: 8443, Samples: 5, Timeout: Duration(time.Second)},
+		MinGain:    MinGain{Abs: Duration(10 * time.Millisecond), Rel: 0.2},
+		TTL:        Duration(2 * time.Hour),
+		FlapDamp:   FlapDamping{Window: Duration(time.Hour), MaxSwitches: 3},
+	}
+	if !reflect.DeepEqual(c.Learning, want) {
+		t.Errorf("learning:\n got %+v\nwant %+v", c.Learning, want)
+	}
+}
+
 func TestUCIRepeatedOptions(t *testing.T) {
 	c, err := ParseUCI([]byte(uciBase + "\toption mark 3\n\tlist target '198.51.100.2'\n"))
 	if err != nil {
@@ -148,6 +177,9 @@ func TestUCIInvalid(t *testing.T) {
 		{"number", uciBase + "\toption min_ok one\n", `invalid number "one"`},
 		{"bool", strings.Replace(uciBase, "option mark_mask '0xf'", "option mark_mask '0xf'\n\toption cleanup_on_exit maybe", 1), `invalid boolean "maybe"`},
 		{"duration", uciBase + "\toption interval soon\n", `invalid duration "soon"`},
+		{"percent", strings.Replace(uciBase, "list ingress 'lan0'", "list ingress 'lan0'\n\toption learn_min_gain_rel 15", 1), `invalid percentage "15"`},
+		{"port", strings.Replace(uciBase, "list ingress 'lan0'", "list ingress 'lan0'\n\toption learn_port 70000", 1), `invalid number "70000"`},
+		{"learning in tunnel", uciBase + "\toption learn_ttl 1h\n", `unknown option "learn_ttl" in tunnel section`},
 		{"address", uciBase + "\tlist target nowhere\n", `invalid address "nowhere"`},
 		{"prefix", uciBase + "\tlist prefer '10.0.0.1/8'\n", "host bits set"},
 		{"outside section", "option a b\n", "outside a config section"},

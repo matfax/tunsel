@@ -166,13 +166,21 @@ func (d Duration) D() time.Duration { return time.Duration(d) }
 type Percent float64
 
 func (p *Percent) UnmarshalYAML(n *yaml.Node) error {
-	s, ok := strings.CutSuffix(strings.TrimSpace(n.Value), "%")
-	v, err := strconv.ParseFloat(s, 64)
-	if !ok || err != nil || v < 0 {
-		return fmt.Errorf("line %d: invalid percentage %q", n.Line, n.Value)
+	v, err := parsePercent(n.Value)
+	if err != nil {
+		return fmt.Errorf("line %d: %w", n.Line, err)
 	}
-	*p = Percent(v / 100)
+	*p = v
 	return nil
+}
+
+func parsePercent(s string) (Percent, error) {
+	num, ok := strings.CutSuffix(strings.TrimSpace(s), "%")
+	v, err := strconv.ParseFloat(num, 64)
+	if !ok || err != nil || v < 0 {
+		return 0, fmt.Errorf("invalid percentage %q", s)
+	}
+	return Percent(v / 100), nil
 }
 
 // Prefix is a CIDR prefix; a bare address means a host prefix.
@@ -271,6 +279,7 @@ func (c *Config) setDefaults() {
 		t := true
 		c.Conntrack.FlushOnUnhealthy = &t
 	}
+	c.Learning.setDefaults()
 	if c.Log.Level == "" {
 		c.Log.Level = "info"
 	}
@@ -279,6 +288,29 @@ func (c *Config) setDefaults() {
 	}
 	if c.Status.Socket == "" {
 		c.Status.Socket = DefaultSocket
+	}
+}
+
+// setDefaults fills in the learning parameters (design §7). As elsewhere,
+// zero means the default.
+func (l *Learning) setDefaults() {
+	setDefault(&l.Candidates.Source, "conntrack")
+	setDefault(&l.Candidates.TopN, 100)
+	setDefault(&l.Candidates.Refresh, Duration(5*time.Minute))
+	setDefault(&l.Probe.Port, 443)
+	setDefault(&l.Probe.Samples, 3)
+	setDefault(&l.Probe.Timeout, Duration(2*time.Second))
+	setDefault(&l.MinGain.Abs, Duration(5*time.Millisecond))
+	setDefault(&l.MinGain.Rel, 0.15)
+	setDefault(&l.TTL, Duration(time.Hour))
+	setDefault(&l.FlapDamp.Window, Duration(30*time.Minute))
+	setDefault(&l.FlapDamp.MaxSwitches, 2)
+}
+
+func setDefault[T comparable](dst *T, v T) {
+	var zero T
+	if *dst == zero {
+		*dst = v
 	}
 }
 
@@ -306,6 +338,7 @@ func (c *Config) validate() error {
 	c.validateDefaultOrder(&errs, byName)
 	c.validateIngress(&errs, byName)
 	c.validateStaticPref(&errs, byName)
+	c.Learning.validate(&errs)
 	c.validateMisc(&errs)
 
 	return errors.Join(errs...)
@@ -452,6 +485,40 @@ func (c *Config) validateStaticPref(errs *errList, byName map[string]*Tunnel) {
 			errs.fail("static_pref[%d]: prefix %s listed twice", i, s.Prefix)
 		}
 		staticSeen[s.Prefix.Prefix] = true
+	}
+}
+
+// validate checks the learning parameters, also while learning is off, so
+// that a typo shows up when it is saved rather than when learning is
+// switched on.
+func (l *Learning) validate(errs *errList) {
+	if l.Candidates.Source != "conntrack" {
+		errs.fail("learning.candidates.source %q: expected conntrack", l.Candidates.Source)
+	}
+	if l.Candidates.TopN < 1 {
+		errs.fail("learning.candidates.top_n: must be at least 1")
+	}
+	if l.Probe.Samples < 1 {
+		errs.fail("learning.probe.samples: must be at least 1")
+	}
+	if l.FlapDamp.MaxSwitches < 1 {
+		errs.fail("learning.flap_damping.max_switches: must be at least 1")
+	}
+	for _, d := range []struct {
+		name string
+		v    Duration
+	}{
+		{"candidates.refresh", l.Candidates.Refresh},
+		{"probe.timeout", l.Probe.Timeout},
+		{"ttl", l.TTL},
+		{"flap_damping.window", l.FlapDamp.Window},
+	} {
+		if d.v <= 0 {
+			errs.fail("learning.%s: must be positive", d.name)
+		}
+	}
+	if l.MinGain.Abs < 0 {
+		errs.fail("learning.min_gain.abs: must not be negative")
 	}
 }
 
