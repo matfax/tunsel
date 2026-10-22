@@ -208,7 +208,7 @@ function learnedSection(learned) {
 		e.tunnel ? E('strong', {}, [ text(e.tunnel) ]) : '–',
 		e.baseline || '–',
 		e.outcome,
-		lines(Object.entries(e.rtt_ms ?? {}).sort().map(([ n, v ]) => `${n}: ${ms(v)}`)),
+		lines(Object.entries(e.rtt_ms ?? {}).sort(([ a ], [ b ]) => a.localeCompare(b)).map(([ n, v ]) => `${n}: ${ms(v)}`)),
 		_('in %s').format(until(e.expires))
 	]);
 	return E('div', { 'class': 'cbi-section' }, [
