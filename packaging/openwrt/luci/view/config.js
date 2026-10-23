@@ -1,12 +1,13 @@
 'use strict';
 'require view';
 'require form';
+'require rpc';
 'require uci';
 'require tools.widgets as widgets';
 
 // Provided by LuCI's loader: the modules required above, plus L (and _,
 // which ESLint already knows).
-/* global L, form, uci, view, widgets */
+/* global L, form, rpc, uci, view, widgets */
 
 // Mirrors the UCI schema read by the daemon (internal/config/uci.go). The
 // daemon validates everything again on reload; these checks only catch
@@ -15,6 +16,13 @@
 // One Go duration term, e.g. "1.5s"; a duration is one or more of them.
 // Without nested quantifiers, so matching stays linear.
 const DURATION_TERM = /\d+\.?\d*(?:ns|us|µs|ms|s|m|h)/y;
+
+const callInitAction = rpc.declare({
+	object: 'luci',
+	method: 'setInitAction',
+	params: [ 'name', 'action' ],
+	expect: { result: false }
+});
 
 function number(_sid, value) {
 	if (value === '' || /^(?:0x[\da-fA-F]+|\d+)$/.test(value))
@@ -198,10 +206,25 @@ function tunnelHealthOptions(s) {
 	healthValue(s, 'recover_after', _('Recover after'), _('Consecutive passed rounds before the tunnel is healthy again.'), '3', 'uinteger');
 }
 
+// Runs once Save & Apply has committed: "enabled" enables and starts the
+// service, or disables and stops it. The reload trigger alone cannot start
+// a service that is disabled or stopped, since procd only keeps the trigger
+// of a started one. Both calls go out at once: LuCI reloads the page shortly
+// after the apply.
+function followEnabled() {
+	const on = uci.get('tunsel', 'main', 'enabled') === '1';
+	return Promise.all([
+		callInitAction('tunsel', on ? 'enable' : 'disable'),
+		callInitAction('tunsel', on ? 'start' : 'stop')
+	]);
+}
+
 return view.extend({
 	load: () => uci.load('tunsel'),
 
 	render: () => {
+		document.addEventListener('uci-applied', followEnabled);
+
 		const m = new form.Map('tunsel', _('Tunsel'),
 			_('Health-aware selection between VPN tunnels, optionally the fastest per destination. Per tunnel, the router must provide a routing table with a default route via the tunnel and a rule "fwmark MARK/MASK lookup TABLE". Unmarked traffic falls through to normal routing.'));
 

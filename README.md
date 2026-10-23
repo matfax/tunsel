@@ -60,12 +60,13 @@ destinations):
 opkg update && opkg install ./tunsel_<version>_<arch>.ipk ./luci-app-tunsel_<version>_all.ipk
 ```
 
-Configure in LuCI and Save & Apply, or from the shell:
+Configure in LuCI and Save & Apply (Enabled also enables and starts the
+service, or disables and stops it), or from the shell:
 
 ```sh
 uci set tunsel.main.enabled=1        # plus your tunnels; see /etc/config/tunsel
 uci commit tunsel
-/etc/init.d/tunsel reload            # validate, then SIGHUP (or start, stop if disabled)
+/etc/init.d/tunsel reload            # validate, then SIGHUP (or enable+start; disable+stop if disabled)
 tunsel status                        # -flows: conntrack per tunnel; -history: RTT history; -learned: measured destinations
 logread -e tunsel
 ```
