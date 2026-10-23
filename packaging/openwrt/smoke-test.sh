@@ -100,15 +100,17 @@ reload_config
 i=0; until [ "$(logread | grep -c "configuration reloaded")" -gt "$n" ]; do i=$((i+1)); [ $i -lt 10 ] || fail "uci commit did not reload"; sleep 1; done
 [ "$(pid)" = "$p" ] || fail "trigger restarted the daemon"
 
-echo "- disabling stops it"
+echo "- disabling disables and stops it; enabling enables and starts it"
 uci set tunsel.main.enabled=0
 uci commit tunsel
 /etc/init.d/tunsel reload
 until_pid stopped || fail "still running while disabled"
+if /etc/init.d/tunsel enabled; then fail "still enabled at boot while disabled"; fi
 uci set tunsel.main.enabled=1
 uci commit tunsel
 /etc/init.d/tunsel reload
 until_pid running || fail "not started again when enabled"
+/etc/init.d/tunsel enabled || fail "not enabled at boot again"
 p=$(pid)
 until_status || fail "status socket after enabling"
 

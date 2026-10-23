@@ -1,6 +1,6 @@
 # Requirements
 
-<!-- reqtracker:v2 next=10 -->
+<!-- reqtracker:v2 next=11 -->
 
 > Tracked automatically from what the user stated or explicitly approved. Suggestions Claude made on its own are not recorded here.
 
@@ -13,3 +13,4 @@
 - [x] `R7` CI attests build provenance and an SBOM with actions/attest for the image and ipk packages on v* tags `+ci` `+build` `2026-10-19 → met 2026-10-19: reworded to the code and confirmed by the user before a commit`
 - [x] `R8` Codacy does not flag the id-token: write permission in the signing workflow as a hard-coded token `+ci` `2026-10-19 → met 2026-10-19: Finding marked as false positive in Codacy; fresh analysis of the PR reports 0 issues, down from 1`
 - [x] `R9` Releases are cut by a manually run release workflow with a dropdown to pick whether Major, Minor or Patch is bumped `+ci` `+build` `2026-10-19 → met 2026-10-19: Release workflow changes committed as 1a268c6 on ci/attestations; manually run release workflow with patch, minor or major choice`
+- [x] `R10` The LuCI Enabled setting enables and starts the tunsel service when switched on, and disables and stops it when switched off. `+build` `2026-10-23 → met 2026-10-23: LuCI's Enabled switch now controls the service fully - enable+start on, disable+stop off`

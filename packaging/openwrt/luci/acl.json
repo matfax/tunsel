@@ -8,6 +8,9 @@
 			"uci": [ "tunsel" ]
 		},
 		"write": {
+			"ubus": {
+				"luci": [ "setInitAction" ]
+			},
 			"uci": [ "tunsel" ]
 		}
 	}
