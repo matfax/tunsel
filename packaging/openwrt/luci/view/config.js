@@ -223,7 +223,8 @@ return view.extend({
 	load: () => uci.load('tunsel'),
 
 	render: () => {
-		document.addEventListener('uci-applied', followEnabled);
+		// render runs once per page load, and a successful apply reloads the page.
+		document.addEventListener('uci-applied', followEnabled, { once: true });
 
 		const m = new form.Map('tunsel', _('Tunsel'),
 			_('Health-aware selection between VPN tunnels, optionally the fastest per destination. Per tunnel, the router must provide a routing table with a default route via the tunnel and a rule "fwmark MARK/MASK lookup TABLE". Unmarked traffic falls through to normal routing.'));
